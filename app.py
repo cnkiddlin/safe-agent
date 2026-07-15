@@ -67,7 +67,7 @@ def add_log(level, message, detail=""):
     return log_entry
 
 
-# ====== Agent Token Exchange 机制（JWT/OIDC → Vault Token 兑换） ======
+# ====== Agent Token Exchange 机制（OBO Token → Vault Token 兑换） ======
 # 缓存 Vault Token，用于后续获取 API Token
 vault_token_cache = {
     "token": None,
@@ -76,21 +76,83 @@ vault_token_cache = {
 }
 VAULT_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
 
+# OBO Token 缓存
+obo_token_cache = {
+    "token": None,
+    "cached_at": 0.0,
+    "expires_at": 0.0,
+}
+OBO_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
 
-def exchange_jwt_for_vault_token(jwt_token: str = "") -> str:
-    """用 IBM Verify Access Token 向 Vault 的 JWT/OIDC 认证方法兑换 Vault Token"""
-    add_log("AGENT", "执行 IBM Verify Access Token → Vault Token Exchange")
 
+def get_verify_client_credential_from_vault():
+    """从 Vault 获取预先存放的 Verify Client Credential（Demo 模拟模式）"""
     time.sleep(0.5)
+    credential = {
+        "client_id": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
+        "client_secret": f"mock-secret-{uuid.uuid4().hex[:16]}",
+    }
+    add_log("AGENT", f"从 Vault 获取 Verify Client Credential",
+            f"client_id: {credential['client_id']}")
+    add_log("AGENT", "Verify Client Credential 获取成功")
+    return credential
 
-    vault_token = f"vault-jwt-{uuid.uuid4().hex[:16]}"
-    add_log("AGENT", f"Vault JWT 认证通过，已获取并缓存 Vault Token（TTL {VAULT_TOKEN_CACHE_TTL // 60} 分钟）")
+
+def exchange_to_obo_token(client_credential):
+    """用 Verify Client Credential 向 Verify 发起 OBO Token Exchange（Demo 模拟模式）"""
+    time.sleep(0.8)
+    obo_token = f"obo-token-{uuid.uuid4().hex[:16]}"
+    add_log("AGENT", f"执行 Token Exchange，获取 OBO Token",
+            f"TTL {OBO_TOKEN_CACHE_TTL // 60} 分钟")
+    return obo_token
+
+
+def ensure_obo_token() -> str:
+    """获取 OBO Token，优先使用本地缓存"""
+    now = time.time()
+    cached = obo_token_cache["token"]
+    expires = obo_token_cache["expires_at"]
+
+    if cached and expires > now:
+        remaining = int(expires - now)
+        add_log("AGENT", f"OBO Token 缓存命中，直接复用（剩余 {remaining}s）")
+        return cached
+
+    # 2. 检查 Session 缓存（跨请求持久化，防止 reloader 重启丢失）
+    sess_obo_token = session.get("obo_token")
+    sess_expires = session.get("obo_token_expires_at", 0.0)
+    if sess_obo_token and sess_expires > now:
+        obo_token_cache["token"] = sess_obo_token
+        obo_token_cache["cached_at"] = session.get("obo_token_cached_at", now)
+        obo_token_cache["expires_at"] = sess_expires
+        remaining = int(sess_expires - now)
+        add_log("AGENT", f"OBO Token Session 缓存命中，直接复用（剩余 {remaining}s）")
+        return sess_obo_token
+
+    credential = get_verify_client_credential_from_vault()
+    obo_token = exchange_to_obo_token(credential)
 
     now = time.time()
-    vault_token_cache["token"] = vault_token
-    vault_token_cache["cached_at"] = now
-    vault_token_cache["expires_at"] = now + VAULT_TOKEN_CACHE_TTL
-    return vault_token
+    obo_token_cache["token"] = obo_token
+    obo_token_cache["cached_at"] = now
+    obo_token_cache["expires_at"] = now + OBO_TOKEN_CACHE_TTL
+
+    # 同步写入 Session，即使进程重启也能复用
+    session["obo_token"] = obo_token
+    session["obo_token_cached_at"] = now
+    session["obo_token_expires_at"] = now + OBO_TOKEN_CACHE_TTL
+
+    return obo_token
+
+
+def get_app_secret_key(vault_token: str = ""):
+    """获取应用秘钥（Demo 模拟模式）"""
+    time.sleep(0.3)
+    app_secret = f"app-secret-{uuid.uuid4().hex[:16]}"
+    return {
+        "status": "SUCCESS",
+        "app_secret_key": app_secret,
+    }
 
 
 def ensure_vault_token() -> str:
@@ -101,16 +163,45 @@ def ensure_vault_token() -> str:
 
     if cached and expires > now:
         remaining = int(expires - now)
-        add_log("AGENT", "Token Exchange: 缓存命中，直接复用",
-                f"Vault Token 剩余有效期 {remaining}s")
+        add_log("AGENT", f"Vault Token 缓存命中，直接复用（剩余 {remaining}s）")
         return cached
 
-    add_log("AGENT", "Token Exchange: 本地无缓存，重新获取",
-            "用 IBM Verify Access Token 向 Vault 发起 Token Exchange 请求")
-    # 实际场景中 Access Token 来自 Verify 登录时下发的 ID Token
-    user_info = session.get("user", FAKE_USER)
-    jwt_token = user_info.get("id_token", "")
-    return exchange_jwt_for_vault_token(jwt_token)
+    # 2. 检查 Session 缓存（跨请求持久化，防止 reloader 重启丢失）
+    sess_vault_token = session.get("vault_token")
+    sess_expires = session.get("vault_token_expires_at", 0.0)
+    if sess_vault_token and sess_expires > now:
+        vault_token_cache["token"] = sess_vault_token
+        vault_token_cache["cached_at"] = session.get("vault_token_cached_at", now)
+        vault_token_cache["expires_at"] = sess_expires
+        remaining = int(sess_expires - now)
+        add_log("AGENT", f"Vault Token Session 缓存命中，直接复用（剩余 {remaining}s）")
+        return sess_vault_token
+
+    add_log("AGENT", "未检测到 OBO Token 和 Vault Token 的缓存")
+
+    # 确保 OBO Token 可用
+    obo_token = ensure_obo_token()
+
+    # 用 OBO Token 向 Vault 进行身份验证
+    time.sleep(0.5)
+    vault_token = f"vault-token-{uuid.uuid4().hex[:16]}"
+    add_log("AGENT", "使用 OBO Token 通过 Vault 身份验证")
+    add_log("AGENT", f"Vault Token 已缓存（TTL {VAULT_TOKEN_CACHE_TTL // 60} 分钟）")
+
+    now = time.time()
+    vault_token_cache["token"] = vault_token
+    vault_token_cache["cached_at"] = now
+    vault_token_cache["expires_at"] = now + VAULT_TOKEN_CACHE_TTL
+
+    # 同步写入 Session，即使进程重启也能复用
+    session["vault_token"] = vault_token
+    session["vault_token_cached_at"] = now
+    session["vault_token_expires_at"] = now + VAULT_TOKEN_CACHE_TTL
+
+    # 获取应用秘钥
+    get_app_secret_key(vault_token)
+
+    return vault_token
 
 
 # ====== MCP 工具注册 ======
@@ -197,7 +288,7 @@ def get_api_token_from_vault(operation_name: str, vault_token: str = ""):
             path=f"order/user_zhangsan/{operation_name}",
         )
         api_token = response["data"][f"{operation_name}_api_token"]
-        add_log("AGENT", f"获取 API Token 成功（ {operation_name.upper()} 操作）")
+        add_log("AGENT", f"获取 API Token（ {operation_name.upper()} 操作）")
         return {
             "status": "SUCCESS",
             "operation": operation_name,
@@ -218,7 +309,7 @@ async def _handle_get_api_token(args):
 
 async def _handle_list_orders(args):
     api_token = args.get("api_token", "")
-    add_log("AGENT", "查看订单列表")
+    add_log("AGENT", "调用 list_orders 服务，查看订单列表")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             status = args.get("status", "")
@@ -477,7 +568,7 @@ def handle_chat_message(data):
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
+                # add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
 
                 # ====== 敏感操作检查 ======
                 if fn_name == "delete_order":
@@ -501,7 +592,7 @@ def handle_chat_message(data):
                         time.sleep(1.0)  # 模拟用户授权后的处理延迟
                         # 用户确认后，再从 Vault 获取删除权限 Token
                         if not fn_args.get("api_token"):
-                            add_log("AGENT", "用户已授权，正在从 Vault 获取删除权限 Token")
+                            add_log("AGENT", "用户已授权")
                             vault_token_op = ensure_vault_token()
                             vault_result = get_api_token_from_vault("delete", vault_token_op)
                             if vault_result.get("status") == "SUCCESS":
@@ -536,7 +627,7 @@ def handle_chat_message(data):
                 if tool_result is None:
                     tool_result = json.dumps({"error": f"未知工具: {fn_name}"})
 
-                add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
+                # add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
 
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": tool_result})
 
@@ -544,11 +635,13 @@ def handle_chat_message(data):
             while True:
                 final_response = call_opencode(messages)
                 if "error" in final_response:
+                    add_log("AGENT", "AI 助手回复（出错）", final_response['error'][:300])
                     emit("chat_response", {"role": "assistant", "content": f"处理完成（API 返回错误: {final_response['error']}）", "tool_results": True})
                     break
 
                 final_tool_calls = final_response.get("tool_calls", [])
                 if not final_tool_calls:
+                    add_log("AGENT", "AI 助手回复", final_response.get("content", "处理完成。")[:500])
                     emit("chat_response", {"role": "assistant", "content": final_response.get("content", "处理完成。"), "tool_results": True})
                     break
 
@@ -571,7 +664,7 @@ def handle_chat_message(data):
                     except json.JSONDecodeError:
                         fn_args = {}
 
-                    add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
+                    # add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
 
                     # ====== 敏感操作检查 ======
                     if fn_name == "delete_order":
@@ -628,11 +721,12 @@ def handle_chat_message(data):
                     if tool_result is None:
                         tool_result = json.dumps({"error": f"未知工具: {fn_name}"})
 
-                    add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
+                    # add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
                     messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": tool_result})
 
                 # 循环继续——让 AI 基于工具结果生成下一轮回复（可能是最终文本或更多工具调用）
         else:
+            add_log("AGENT", "AI 助手回复", assistant_content[:500])
             emit("chat_response", {"role": "assistant", "content": assistant_content})
 
     except Exception as e:
@@ -684,16 +778,6 @@ def call_opencode(messages):
             choice = result["choices"][0]
             message = choice["message"]
 
-            reasoning = message.get("content", "")
-            if message.get("tool_calls"):
-                fn_list = ", ".join([tc["function"]["name"] for tc in message["tool_calls"]])
-                if reasoning:
-                    reasoning += f" -> 调用 {fn_list}"
-                else:
-                    reasoning = f"调用 {fn_list}"
-            if reasoning:
-                add_log("AGENT", reasoning[:300])
-
             return {"content": message.get("content", ""), "tool_calls": message.get("tool_calls", [])}
     except Exception as e:
         return {"error": str(e)}
@@ -704,4 +788,4 @@ if __name__ == "__main__":
     print("  AI 智能助手 v1.1")
     print("  启动: http://127.0.0.1:18923")
     print("=" * 50)
-    socketio.run(app, host="127.0.0.1", port=18923, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="127.0.0.1", port=18923, debug=True, use_reloader=False, allow_unsafe_werkzeug=True)
