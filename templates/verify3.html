@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <title>IBM Verify - Authorize</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        html, body {
+            height: 100%;
+            background: #ffffff;
+            color: #161616;
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+        }
+        /* 顶部蓝色 accent 条 */
+        .accent-bar {
+            height: 4px;
+            background: linear-gradient(90deg, #0f62fe, #0043ce);
+            flex-shrink: 0;
+        }
+        /* 头部 */
+        .header {
+            padding: 28px 28px 16px;
+            flex-shrink: 0;
+        }
+        .brand {
+            font-size: 11px;
+            color: #525252;
+            font-weight: 500;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .title {
+            font-size: 20px;
+            font-weight: 300;
+            line-height: 1.3;
+        }
+        /* 动作信息卡片 */
+        .action-card {
+            margin: 0 24px;
+            padding: 14px 16px;
+            background: #f4f4f4;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        .action-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e8e8e8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+        .action-icon svg {
+            color: #161616;
+        }
+        .action-label {
+            font-size: 11px;
+            color: #525252;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            font-weight: 500;
+        }
+        .action-value {
+            font-size: 14px;
+            color: #161616;
+            font-weight: 500;
+        }
+        /* 正文内容 */
+        .body-content {
+            flex: 1;
+            padding: 24px 28px;
+            font-size: 14px;
+            color: #525252;
+            line-height: 1.7;
+        }
+        /* 底部按钮区 */
+        .footer {
+            border-top: 1px solid #e0e0e0;
+            padding: 16px 24px;
+            display: flex;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .btn {
+            flex: 1;
+            height: 42px;
+            border: none;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: all 0.15s ease;
+        }
+        .btn-deny {
+            background: #f4f4f4;
+            color: #161616;
+        }
+        .btn-deny:hover {
+            background: #e0e0e0;
+        }
+        .btn-approve {
+            background: #0f62fe;
+            color: #ffffff;
+        }
+        .btn-approve:hover {
+            background: #0353e9;
+        }
+        .btn-spinner {
+            display: none;
+        }
+        .btn-spinner svg {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .btn-approve.loading .btn-spinner {
+            display: inline-block;
+        }
+        .btn-approve.loading .btn-label {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="accent-bar"></div>
+    <div class="header">
+        <div class="brand">IBM Security Verify</div>
+        <div class="title">Authorize AI Agent Action</div>
+    </div>
+    <div class="action-card">
+        <div class="action-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+        </div>
+        <div>
+            <div class="action-label">Action</div>
+            <div class="action-value" id="actionDetail">Delete Order</div>
+        </div>
+    </div>
+    <div class="body-content" id="verifyMessage">
+        The AI agent is requesting authorization. Please review and confirm.
+    </div>
+    <div class="footer">
+        <button class="btn btn-deny" onclick="handleDeny()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
+            </svg>
+            Deny
+        </button>
+        <button class="btn btn-approve" id="approveBtn" onclick="handleApprove()">
+            <span class="btn-spinner">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <circle cx="12" cy="12" r="10" stroke-dasharray="30 70" stroke-linecap="round"/>
+                </svg>
+            </span>
+            <span class="btn-label">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                    <path d="M5 13l4 4L19 7"/>
+                </svg>
+                Approve
+            </span>
+        </button>
+    </div>
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const actionEl = document.getElementById('actionDetail');
+        const action = params.get('action') || 'Delete Order';
+        actionEl.textContent = action;
+
+        function handleDeny() {
+            window.parent.postMessage({ type: 'verify3_response', approved: false }, '*');
+        }
+        async function handleApprove() {
+            const btn = document.getElementById('approveBtn');
+            const denyBtn = document.querySelector('.btn-deny');
+            btn.classList.add('loading');
+            btn.disabled = true;
+            denyBtn.disabled = true;
+            denyBtn.style.opacity = '0.5';
+            // 显示转圈等待，模拟验证处理过程
+            await new Promise(resolve => setTimeout(resolve, 2500));
+            window.parent.postMessage({ type: 'verify3_response', approved: true }, '*');
+        }
+    </script>
+</body>
+</html>

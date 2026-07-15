@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <title>IBM Verify - Sign in</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        body, html { height: 100%; background-color: #f4f4f4; overflow: hidden; }
+        .page-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: #ffffff;
+            z-index: 9999;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.35s ease;
+        }
+        .page-overlay.active { opacity: 1; pointer-events: auto; }
+        
+        .container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            animation: pageFadeIn 0.5s ease-out;
+        }
+        @keyframes pageFadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* 左侧插图 — 整体上移 */
+        .left-panel {
+            flex: 1;
+            background-color: #f4f4f4;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px 40px;
+        }
+        .illustration {
+            width: 85%;
+            max-width: 420px;
+            height: auto;
+        }
+
+        /* 右侧登录表单区域 — 视觉居中 */
+        .right-panel {
+            flex: 0 0 50%;
+            background-color: #ffffff;
+            display: flex;
+            flex-direction: column;
+            padding: 100px 8% 60px 60px;
+            max-width: 560px;
+        }
+        .brand {
+            font-size: 13px;
+            color: #525252;
+            margin-bottom: 8px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        .title {
+            font-size: 30px;
+            font-weight: 300;
+            color: #161616;
+            margin-bottom: 6px;
+            line-height: 1.15;
+        }
+        .subtitle {
+            font-size: 16px;
+            color: #525252;
+            margin-bottom: 36px;
+            font-weight: 400;
+        }
+
+        .options-container { display: flex; gap: 16px; margin-bottom: 40px; }
+
+        .option-card {
+            background-color: #f4f4f4;
+            width: 300px;
+            padding: 16px 20px 20px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            transition: background-color 0.2s, box-shadow 0.2s;
+            border: 2px solid transparent;
+            position: relative;
+        }
+        .option-card:hover { background-color: #e8e8e8; }
+        .option-card:active { border-color: #0f62fe; }
+        .option-card.passkey-loading { pointer-events: none; opacity: 0.7; }
+        .option-card .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #161616;
+            margin-bottom: 5px;
+        }
+        .option-card .card-subtitle {
+            font-size: 16px;
+            color: #525252;
+            margin-bottom: 80px;
+            line-height: 1.4;
+        }
+        .option-card .card-icon { margin-top: auto; align-self: center; }
+        
+        .card-spinner { display: none; margin-top: 8px; align-self: center; }
+        .option-card.passkey-loading .card-spinner { display: block; }
+        .card-spinner svg { animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .dropdown-alternative {
+            width: 100%;
+            border-top: 1px solid #e0e0e0;
+            padding: 16px 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            color: #161616;
+            font-size: 14px;
+        }
+        .dropdown-alternative:hover { color: #0f62fe; }
+        .dropdown-alternative:hover .arrow-down { border-color: #0f62fe; }
+        .arrow-down {
+            width: 10px; height: 10px;
+            border-right: 1.5px solid #525252;
+            border-bottom: 1.5px solid #525252;
+            transform: rotate(45deg);
+            margin-right: 4px; margin-bottom: 4px;
+            transition: border-color 0.2s;
+        }
+
+        @media (max-width: 768px) {
+            .container { flex-direction: column; }
+            .left-panel { padding: 40px 20px 10px; align-items: center; }
+            .right-panel { padding: 20px 24px 40px; max-width: 100%; flex: 1; }
+            .option-card { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="page-overlay" id="pageOverlay"></div>
+    <div class="container">
+        <!-- 左侧插图区域 — 整体上移 -->
+        <div class="left-panel">
+            <svg class="illustration" viewBox="0 0 400 300" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <!-- 背景柔光 -->
+                <circle cx="200" cy="150" r="120" fill="rgba(15,98,254,0.04)"/>
+                <circle cx="200" cy="150" r="100" fill="rgba(15,98,254,0.03)"/>
+                <!-- 主设备 — 手机 -->
+                <rect x="145" y="40" width="110" height="188" rx="16" stroke="#161616" stroke-width="1.8" fill="#ffffff"/>
+                <rect x="153" y="62" width="94" height="140" rx="2" fill="#F8FAFC" stroke="#E5E7EB" stroke-width="0.8"/>
+                <!-- 刘海 -->
+                <rect x="182" y="46" width="36" height="5" rx="2.5" fill="#161616"/>
+                <!-- 状态栏 -->
+                <circle cx="163" cy="56" r="2" fill="#9CA3AF"/>
+                <circle cx="171" cy="56" r="2" fill="#9CA3AF"/>
+                <circle cx="179" cy="56" r="2" fill="#9CA3AF"/>
+                <!-- 屏幕上的安全盾牌勾选 -->
+                <circle cx="200" cy="132" r="32" fill="rgba(15,98,254,0.08)"/>
+                <path d="M200 110 l14 5 v11 q0 13 -14 18 q-14 -5 -14 -18 v-11 z" stroke="#0f62fe" stroke-width="1.8" fill="rgba(15,98,254,0.06)"/>
+                <path d="M191 128 l7 6 11 -11" stroke="#0f62fe" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+                <!-- Home indicator -->
+                <rect x="185" y="215" width="30" height="3" rx="1.5" fill="#D1D5DB"/>
+                <!-- 装饰圆点 -->
+                <circle cx="55" cy="75" r="3" fill="#0f62fe" opacity="0.12"/>
+                <circle cx="345" cy="75" r="3" fill="#0f62fe" opacity="0.12"/>
+                <circle cx="345" cy="225" r="3" fill="#0f62fe" opacity="0.12"/>
+                <circle cx="55" cy="225" r="3" fill="#0f62fe" opacity="0.12"/>
+            </svg>
+        </div>
+
+        <!-- 右侧登录表单 -->
+        <div class="right-panel">
+            <div class="brand">IBM Security Verify</div>
+            <div class="title">Sign in without a password</div>
+            <div class="subtitle">Use a security method to sign in to your account.</div>
+
+            <div class="options-container">
+            <div class="option-card" id="passkeyCard" onclick="handlePasskeyClick()">
+                <div class="card-title">Passkey</div>
+                <div class="card-subtitle">Use your passkey to sign in</div>
+
+
+                <div class="card-spinner">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0f62fe" stroke-width="2.5">
+                            <circle cx="12" cy="12" r="10" stroke-dasharray="30 70" stroke-linecap="round"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dropdown-alternative">
+                <span>Sign in another way</span>
+                <div class="arrow-down"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function navigateWithTransition(url) {
+            const overlay = document.getElementById('pageOverlay');
+            overlay.classList.add('active');
+            setTimeout(() => { window.location.href = url; }, 350);
+        }
+        async function handlePasskeyClick() {
+            const card = document.getElementById('passkeyCard');
+            if (card.classList.contains('passkey-loading')) return;
+            card.classList.add('passkey-loading');
+            try {
+                if (window.PublicKeyCredential && typeof navigator.credentials?.get === 'function') {
+                    const challenge = new Uint8Array(32);
+                    window.crypto.getRandomValues(challenge);
+                    await navigator.credentials.get({
+                        publicKey: {
+                            challenge: challenge,
+                            rpId: window.location.hostname,
+                            allowCredentials: [],
+                            userVerification: 'required',
+                        }
+                    });
+                    // 模拟生物识别验证后的处理延迟，让流程更真实
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    navigateWithTransition('/verify2');
+                    return;
+                }
+            } catch (e) { /* fallback to simulation */ }
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            navigateWithTransition('/verify2');
+        }
+        document.addEventListener('keydown', (e) => { if (e.key === 'Enter') handlePasskeyClick(); });
+    </script>
+</body>
+</html>

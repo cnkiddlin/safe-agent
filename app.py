@@ -1,0 +1,707 @@
+import json
+import time
+import os
+import uuid
+import threading
+from datetime import datetime
+
+import httpx
+import hvac
+from flask import Flask, render_template, request, jsonify, session
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24).hex()
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ====== 配置 ======
+OPENCODE_API_KEY = os.getenv("OPENCODE_API_KEY", "")
+OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+OPENCODE_MODEL = "deepseek-v4-flash"
+
+# ====== 模拟用户数据（后续对接 OIDC） ======
+FAKE_USER = {
+    "acr": "urn:ibm:security:policy:id:1",
+    "active": True,
+    "app_id": "8397934368532187530",
+    "aud": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
+    "client_id": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
+    "exp": 1770913467,
+    "grant_id": "bf80ed7e-3904-408e-afab-521d373e8484",
+    "grant_type": "authorization_code",
+    "iat": 1770909866,
+    "iss": "https://demos.verify.ibm.com/oauth2",
+    "nbf": 1770909866,
+    "display_name": "张三",
+    "email": "San.Zhang@ibm.com",
+    "employee_id": "AA0001",
+    "lastest_login": "2026-07-03 14:21:06 UTC+8",
+    "status": "Active",
+    "scope": [
+        "email",
+        "agentic",
+        "openid",
+        "profile"
+    ],
+    "sub": "646004DF7C",
+    "token_type": "bearer",
+    "token_use": "access_token",
+    "uniqueSecurityName": "646004DF7C",
+    "userType": "FEDERATED"
+}
+
+# ====== Agent 日志 ======
+agent_logs = []
+
+
+def add_log(level, message, detail=""):
+    log_entry = {
+        "id": str(uuid.uuid4())[:8],
+        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "level": level,
+        "message": message,
+        "detail": detail,
+    }
+    agent_logs.append(log_entry)
+    socketio.emit("agent_log", log_entry)
+    return log_entry
+
+
+# ====== Agent Token Exchange 机制（JWT/OIDC → Vault Token 兑换） ======
+# 缓存 Vault Token，用于后续获取 API Token
+vault_token_cache = {
+    "token": None,
+    "cached_at": 0.0,
+    "expires_at": 0.0,
+}
+VAULT_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
+
+
+def exchange_jwt_for_vault_token(jwt_token: str = "") -> str:
+    """用 IBM Verify Access Token 向 Vault 的 JWT/OIDC 认证方法兑换 Vault Token"""
+    add_log("AGENT", "执行 IBM Verify Access Token → Vault Token Exchange")
+
+    time.sleep(0.5)
+
+    vault_token = f"vault-jwt-{uuid.uuid4().hex[:16]}"
+    add_log("AGENT", f"Vault JWT 认证通过，已获取并缓存 Vault Token（TTL {VAULT_TOKEN_CACHE_TTL // 60} 分钟）")
+
+    now = time.time()
+    vault_token_cache["token"] = vault_token
+    vault_token_cache["cached_at"] = now
+    vault_token_cache["expires_at"] = now + VAULT_TOKEN_CACHE_TTL
+    return vault_token
+
+
+def ensure_vault_token() -> str:
+    """获取 Vault Token，优先使用本地缓存"""
+    now = time.time()
+    cached = vault_token_cache["token"]
+    expires = vault_token_cache["expires_at"]
+
+    if cached and expires > now:
+        remaining = int(expires - now)
+        add_log("AGENT", "Token Exchange: 缓存命中，直接复用",
+                f"Vault Token 剩余有效期 {remaining}s")
+        return cached
+
+    add_log("AGENT", "Token Exchange: 本地无缓存，重新获取",
+            "用 IBM Verify Access Token 向 Vault 发起 Token Exchange 请求")
+    # 实际场景中 Access Token 来自 Verify 登录时下发的 ID Token
+    user_info = session.get("user", FAKE_USER)
+    jwt_token = user_info.get("id_token", "")
+    return exchange_jwt_for_vault_token(jwt_token)
+
+
+# ====== MCP 工具注册 ======
+mcp_tools = []
+mcp_tool_definitions = []
+
+
+def register_mcp_tool(name, description, parameters, handler):
+    tool = {
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+        "handler": handler,
+    }
+    mcp_tools.append(tool)
+    definition = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+    mcp_tool_definitions.append(definition)
+    return tool
+
+
+# ====== 内置工具 ======
+async def _handle_weather(args):
+    city = args.get("city", "未知")
+    add_log("AGENT", f"调用天气查询: {city}")
+    return json.dumps({"city": city, "temperature": "26°C", "weather": "多云", "humidity": "60%"}, ensure_ascii=False)
+
+
+async def _handle_calc(args):
+    expr = args.get("expression", "")
+    add_log("AGENT", f"调用计算器: {expr}")
+    try:
+        result = eval(expr, {"__builtins__": {}}, {})
+        return json.dumps({"expression": expr, "result": result}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+async def _handle_time(args):
+    add_log("AGENT", "查询当前时间")
+    now = datetime.now()
+    return json.dumps({"current_time": now.strftime("%Y-%m-%d %H:%M:%S"), "timezone": "Asia/Shanghai"}, ensure_ascii=False)
+
+
+register_mcp_tool("get_weather", "查询指定城市的天气信息",
+                  {"type": "object", "properties": {"city": {"type": "string", "description": "城市名称"}}, "required": ["city"]},
+                  _handle_weather)
+register_mcp_tool("calculator", "执行数学计算",
+                  {"type": "object", "properties": {"expression": {"type": "string", "description": "数学表达式"}}, "required": ["expression"]},
+                  _handle_calc)
+register_mcp_tool("get_current_time", "获取当前时间和时区信息",
+                  {"type": "object", "properties": {}, "required": []},
+                  _handle_time)
+
+# ====== 订单工具（通过 HTTP 请求 MCP Server） ======
+MCP_ORDER_SERVER_URL = "http://127.0.0.1:18724"
+
+
+def get_api_token_from_vault(operation_name: str, vault_token: str = ""):
+    """从 Vault 获取指定操作类型的 API Token——通过 Vault Token 认证（Demo 模式）"""
+    vault_addr = 'http://127.0.0.1:8200'
+    # Demo 模式：内部使用预先配置的 Vault Token 连接真实 Vault
+    demo_vault_token = os.getenv("VAULT_TOKEN", "<your-vault-token>")
+
+    if operation_name not in ("get", "delete"):
+        return {"status": "FAILED", "message": "operation_name 必须是 'get' 或 'delete'"}
+
+    add_log("AGENT", f"准备从 Vault 获取 API Token ( {operation_name.upper()} 操作)")
+
+    client = hvac.Client(url=vault_addr, token=demo_vault_token)
+    if not client.is_authenticated():
+        add_log("ERROR", "Vault 身份验证失败")
+        return {"status": "FAILED", "message": "Failed to authenticate with Vault"}
+
+    try:
+        response = client.secrets.kv.v1.read_secret(
+            mount_point="secret",
+            path=f"order/user_zhangsan/{operation_name}",
+        )
+        api_token = response["data"][f"{operation_name}_api_token"]
+        add_log("AGENT", f"获取 API Token 成功（ {operation_name.upper()} 操作）")
+        return {
+            "status": "SUCCESS",
+            "operation": operation_name,
+            "api_token": api_token,
+        }
+    except Exception as e:
+        add_log("ERROR", f"读取 Vault Secret 失败: {e}")
+        return {"status": "FAILED", "message": f"Failed to read secret: {str(e)}"}
+
+
+async def _handle_get_api_token(args):
+    """处理 get_api_token_from_vault 工具调用"""
+    vault_token_op = ensure_vault_token()
+    operation = args.get("operation_name", "")
+    result = get_api_token_from_vault(operation, vault_token_op)
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def _handle_list_orders(args):
+    api_token = args.get("api_token", "")
+    add_log("AGENT", "查看订单列表")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            status = args.get("status", "")
+            params = {"api_token": api_token}
+            if status:
+                params["status"] = status
+            resp = await client.get(f"{MCP_ORDER_SERVER_URL}/api/orders", params=params)
+            try:
+                data = resp.json()
+                if data.get("success"):
+                    orders = data.get("orders", [])
+                    lines = [f"共 {len(orders)} 条订单："]
+                    for o in orders:
+                        lines.append(f"- {o['id']} | {o['customer']} | {o['product']} | {o['amount']} | {o['status']}")
+                    return "\n".join(lines)
+            except Exception:
+                pass
+            return resp.text
+    except Exception as e:
+        add_log("ERROR", f"请求 MCP Server 失败: {e}")
+        return json.dumps({"error": f"无法连接到订单服务: {str(e)}"}, ensure_ascii=False)
+
+
+async def _handle_delete_order(args):
+    order_id = args.get("order_id", "")
+    api_token = args.get("api_token", "")
+    add_log("AGENT", f"删除订单 {order_id}")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            params = {"api_token": api_token}
+            resp = await client.delete(f"{MCP_ORDER_SERVER_URL}/api/orders/{order_id}", params=params)
+            return resp.text
+    except Exception as e:
+        add_log("ERROR", f"请求 MCP Server 失败: {e}")
+        return json.dumps({"error": f"无法连接到订单服务: {str(e)}"}, ensure_ascii=False)
+
+
+register_mcp_tool(
+    "get_api_token_from_vault",
+    "仅在查询订单列表时手动调用。从 Vault 获取 API Token 用于 list_orders 工具。"
+    "operation_name 只传 'get'：查询订单列表时传 'get'。"
+    "删除操作不需要调用此工具，系统会自动处理。",
+    {
+        "type": "object",
+        "properties": {
+            "operation_name": {
+                "type": "string",
+                "description": "固定传 'get'（仅用于查询订单列表）",
+                "enum": ["get", "delete"]
+            }
+        },
+        "required": ["operation_name"]
+    },
+    _handle_get_api_token
+)
+
+register_mcp_tool(
+    "list_orders",
+    "查看所有订单列表。必须先调用 get_api_token_from_vault(operation_name='get') 获取 API Token，再将获取到的 api_token 作为此工具的参数传入。"
+    "可选的 status 参数用于按订单状态进行过滤。如果没有先获取 API Token，调用将失败。",
+    {
+        "type": "object",
+        "properties": {
+            "api_token": {"type": "string", "description": "【必填】通过 get_api_token_from_vault('get') 获取的 API Token，用于验证访问权限"},
+            "status": {"type": "string", "description": "订单状态过滤（可选）：待付款/处理中/已发货/已完成"}
+        },
+        "required": ["api_token"]
+    },
+    _handle_list_orders
+)
+
+register_mcp_tool(
+    "delete_order",
+    "根据订单 ID 删除指定订单。直接调用即可，不要先调用 get_api_token_from_vault。"
+    "系统会自动处理：1）弹出安全验证界面让用户授权 2）从 Vault 获取 API Token 3）执行删除。",
+    {
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string", "description": "要删除的订单 ID，如 ORD-20260701-001"},
+            "api_token": {"type": "string", "description": "可选。一般不需要传，系统会在用户授权后自动获取"}
+        },
+        "required": ["order_id"]
+    },
+    _handle_delete_order
+)
+
+# ====== 敏感操作验证机制 ======
+pending_verifications = {}
+
+
+# ====== 路由 ======
+
+@app.route("/")
+def index():
+    """主页"""
+    user = session.get("user")
+    return render_template("index.html", logged_in=bool(user))
+
+
+@app.route("/verify1")
+def verify1():
+    """IBM Verify 登录页面"""
+    return render_template("verify1.html")
+
+
+@app.route("/verify2")
+def verify2():
+    """IBM Verify 授权页面"""
+    return render_template("verify2.html")
+
+
+@app.route("/verify3")
+def verify3():
+    """操作验证页面（可嵌入 iframe）"""
+    return render_template("verify3.html")
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    """模拟 SSO 登录，无需账号密码"""
+    session["user"] = dict(FAKE_USER)
+    add_log("AGENT", f"用户登录: {FAKE_USER['display_name']}")
+    return jsonify({"success": True, "user": session["user"]})
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.pop("user", None)
+    return jsonify({"success": True})
+
+
+@app.route("/api/user", methods=["GET"])
+def get_user():
+    user = session.get("user", FAKE_USER)
+    return jsonify(user)
+
+
+@app.route("/api/check-auth", methods=["GET"])
+def check_auth():
+    """检查登录状态"""
+    user = session.get("user")
+    if user:
+        return jsonify({"logged_in": True, "user": user})
+    return jsonify({"logged_in": False})
+
+
+@app.route("/api/verify-passkey", methods=["POST"])
+def verify_passkey():
+    """模拟 passkey 服务器端验证"""
+    # 在实际应用中，这里会验证 WebAuthn 签名
+    return jsonify({"success": True, "verified": True})
+
+
+@app.route("/api/mcp/tools", methods=["GET"])
+def get_mcp_tools():
+    tools_info = [{"name": t["name"], "description": t["description"], "parameters": t["parameters"]} for t in mcp_tools]
+    return jsonify(tools_info)
+
+
+@app.route("/api/mcp/tools", methods=["POST"])
+def add_mcp_tool():
+    data = request.get_json()
+    name = data.get("name")
+    description = data.get("description")
+    url = data.get("url", "")
+    if not name or not description:
+        return jsonify({"success": False, "message": "名称和描述不能为空"}), 400
+
+    async def external_handler(args):
+        add_log("AGENT", f"调用外部 MCP 工具: {name}", json.dumps({"url": url, "args": args}, ensure_ascii=False))
+        return json.dumps({
+            "tool": name, "status": "simulated",
+            "message": f"工具 {name} 调用成功（模拟返回）",
+        }, ensure_ascii=False)
+
+    params = data.get("parameters", {"type": "object", "properties": {"input": {"type": "string", "description": "输入参数"}}, "required": ["input"]})
+    register_mcp_tool(name, description, params, external_handler)
+    add_log("AGENT", f"注册新 MCP 工具: {name}")
+    return jsonify({"success": True, "tool": {"name": name, "description": description}})
+
+
+@app.route("/api/mcp/tools/<name>", methods=["DELETE"])
+def delete_mcp_tool(name):
+    global mcp_tools, mcp_tool_definitions
+    mcp_tools = [t for t in mcp_tools if t["name"] != name]
+    mcp_tool_definitions = [d for d in mcp_tool_definitions if d["function"]["name"] != name]
+    add_log("AGENT", f"删除 MCP 工具: {name}")
+    return jsonify({"success": True})
+
+
+@app.route("/api/agent/logs", methods=["GET"])
+def get_agent_logs():
+    return jsonify(agent_logs[-200:])
+
+
+@app.route("/api/agent/logs", methods=["DELETE"])
+def clear_agent_logs():
+    agent_logs.clear()
+    return jsonify({"success": True})
+
+
+# ====== WebSocket 聊天 ======
+
+@socketio.on("chat_message")
+def handle_chat_message(data):
+    user = session.get("user", FAKE_USER)
+    user_message = data.get("message", "")
+    history = data.get("history", [])
+
+    if not user_message:
+        return
+
+    add_log("AGENT", f"收到用户消息", user_message[:200])
+
+    messages = [{"role": "system", "content": "你是一个有用的 AI 助手。你可以使用提供的工具来帮助用户。\n"
+                                              "【关于删除操作】当用户要求删除订单时，直接调用 delete_order(order_id=\"xxx\") 即可，不要先调用 get_api_token_from_vault。系统会自动弹出安全验证界面让用户授权并获取 Token。\n"
+                                              "【关于展示信息】展示订单列表时用简洁的中文文本总结，每条订单用短横线一行列出，不要使用 Markdown 表格，不要使用任何 emoji 符号。\n"
+                                              "对于工具调用的结果，请用中文回复用户。"}]
+
+    for msg in history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        response_data = call_opencode(messages)
+
+        if "error" in response_data:
+            error_msg = response_data["error"]
+            add_log("ERROR", f"OpenCode Go API 错误", error_msg)
+            emit("chat_response", {"role": "assistant", "content": f"抱歉，调用 AI 服务时出错：{error_msg}"})
+            return
+
+        assistant_content = response_data.get("content", "")
+        tool_calls = response_data.get("tool_calls", [])
+
+        if tool_calls:
+            emit("chat_response", {
+                "role": "assistant",
+                "content": assistant_content or "正在调用工具处理您的请求...",
+                "tool_calls": [{"name": tc["function"]["name"], "arguments": json.loads(tc["function"].get("arguments", "{}"))} for tc in tool_calls],
+            })
+
+            # ====== 添加 AI 助手消息（包含本次所有 tool_calls，API 要求合并成一条） ======
+            if tool_calls:
+                messages.append({"role": "assistant", "content": assistant_content, "tool_calls": tool_calls})
+
+            for tc in tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args_str = tc["function"].get("arguments", "{}")
+                try:
+                    fn_args = json.loads(fn_args_str)
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
+
+                # ====== 敏感操作检查 ======
+                if fn_name == "delete_order":
+                    verify_id = str(uuid.uuid4())[:8]
+                    event = threading.Event()
+                    pending_verifications[verify_id] = {"approved": None, "event": event, "order_id": fn_args.get("order_id", "")}
+
+                    time.sleep(0.8)  # 模拟验证请求准备过程，让 Verify 面板有真实感
+                    emit("request_verify", {
+                        "verify_id": verify_id,
+                        "order_id": fn_args.get("order_id", ""),
+                        "tool": "delete_order",
+                        "message": f"AI 助手请求删除订单 {fn_args.get('order_id', '')}，请确认。"
+                    })
+
+                    # 等待用户确认（最长 120 秒）
+                    event.wait(timeout=120.0)
+
+                    approved = pending_verifications.get(verify_id, {}).get("approved")
+                    if approved:
+                        time.sleep(1.0)  # 模拟用户授权后的处理延迟
+                        # 用户确认后，再从 Vault 获取删除权限 Token
+                        if not fn_args.get("api_token"):
+                            add_log("AGENT", "用户已授权，正在从 Vault 获取删除权限 Token")
+                            vault_token_op = ensure_vault_token()
+                            vault_result = get_api_token_from_vault("delete", vault_token_op)
+                            if vault_result.get("status") == "SUCCESS":
+                                fn_args["api_token"] = vault_result["api_token"]
+                            else:
+                                add_log("ERROR", "获取 API Token 失败，无法执行删除")
+                                tool_result = json.dumps({"error": "获取 API Token 失败"}, ensure_ascii=False)
+
+                        if fn_args.get("api_token"):
+                            add_log("AGENT", f"调用 delete_order 服务删除订单: {fn_args.get('order_id', '')}")
+                            loop = asyncio_new()
+                            loop.run_until_complete(_handle_delete_order(fn_args))
+                            loop.close()
+                            tool_result = json.dumps({"success": True, "message": f"订单 {fn_args.get('order_id', '')} 已成功删除（用户已授权）"},
+                                                     ensure_ascii=False)
+                    else:
+                        add_log("WARN", "用户拒绝授权，取消删除操作")
+                        tool_result = json.dumps({"cancelled": True, "message": "用户取消了删除操作"}, ensure_ascii=False)
+
+                    if verify_id in pending_verifications:
+                        del pending_verifications[verify_id]
+                else:
+                    # 普通工具执行
+                    tool_result = None
+                    for tool in mcp_tools:
+                        if tool["name"] == fn_name:
+                            loop = asyncio_new()
+                            tool_result = loop.run_until_complete(tool["handler"](fn_args))
+                            loop.close()
+                            break
+
+                if tool_result is None:
+                    tool_result = json.dumps({"error": f"未知工具: {fn_name}"})
+
+                add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
+
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": tool_result})
+
+            # 循环处理 AI 可能继续产生的工具调用（如获取 token 后再调用 list_orders）
+            while True:
+                final_response = call_opencode(messages)
+                if "error" in final_response:
+                    emit("chat_response", {"role": "assistant", "content": f"处理完成（API 返回错误: {final_response['error']}）", "tool_results": True})
+                    break
+
+                final_tool_calls = final_response.get("tool_calls", [])
+                if not final_tool_calls:
+                    emit("chat_response", {"role": "assistant", "content": final_response.get("content", "处理完成。"), "tool_results": True})
+                    break
+
+                # ====== 添加本轮 AI 助手消息（包含 tool_calls），之后才能追加 tool result ======
+                new_content = final_response.get("content", "")
+                messages.append({"role": "assistant", "content": new_content, "tool_calls": final_tool_calls})
+                # 先展示 AI 的中间思考结果（如 "已获取 Token，现在查询订单"）
+                emit("chat_response", {
+                    "role": "assistant",
+                    "content": new_content,
+                    "tool_calls": [{"name": tc["function"]["name"], "arguments": json.loads(tc["function"].get("arguments", "{}"))} for tc in final_tool_calls]
+                })
+
+                # 继续处理新一轮工具调用
+                for tc in final_tool_calls:
+                    fn_name = tc["function"]["name"]
+                    fn_args_str = tc["function"].get("arguments", "{}")
+                    try:
+                        fn_args = json.loads(fn_args_str)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    add_log("AGENT", f"执行工具: {fn_name}", json.dumps(fn_args, ensure_ascii=False))
+
+                    # ====== 敏感操作检查 ======
+                    if fn_name == "delete_order":
+                        verify_id = str(uuid.uuid4())[:8]
+                        event = threading.Event()
+                        pending_verifications[verify_id] = {"approved": None, "event": event, "order_id": fn_args.get("order_id", "")}
+
+                        time.sleep(0.8)  # 模拟验证请求准备过程，让 Verify 面板有真实感
+                        emit("request_verify", {
+                            "verify_id": verify_id,
+                            "order_id": fn_args.get("order_id", ""),
+                            "tool": "delete_order",
+                            "message": f"AI 助手请求删除订单 {fn_args.get('order_id', '')}，请确认。"
+                        })
+
+                        event.wait(timeout=120.0)
+
+                        approved = pending_verifications.get(verify_id, {}).get("approved")
+                        if approved:
+                            time.sleep(1.0)  # 模拟用户授权后的处理延迟
+                            # 用户确认后，再从 Vault 获取删除权限 Token
+                            if not fn_args.get("api_token"):
+                                add_log("AGENT", "用户已授权，正在从 Vault 获取删除权限 Token")
+                                vault_token_op = ensure_vault_token()
+                                vault_result = get_api_token_from_vault("delete", vault_token_op)
+                                if vault_result.get("status") == "SUCCESS":
+                                    fn_args["api_token"] = vault_result["api_token"]
+                                else:
+                                    add_log("ERROR", "获取 API Token 失败，无法执行删除")
+                                    tool_result = json.dumps({"error": "获取 API Token 失败"}, ensure_ascii=False)
+
+                            if fn_args.get("api_token"):
+                                add_log("AGENT", f"调用 delete_order 服务删除订单: {fn_args.get('order_id', '')}")
+                                loop = asyncio_new()
+                                loop.run_until_complete(_handle_delete_order(fn_args))
+                                loop.close()
+                                tool_result = json.dumps({"success": True, "message": f"订单 {fn_args.get('order_id', '')} 已成功删除（用户已授权）"},
+                                                         ensure_ascii=False)
+                        else:
+                            add_log("WARN", "用户拒绝授权，取消删除操作")
+                            tool_result = json.dumps({"cancelled": True, "message": "用户取消了删除操作"}, ensure_ascii=False)
+
+                        if verify_id in pending_verifications:
+                            del pending_verifications[verify_id]
+                    else:
+                        tool_result = None
+                        for tool in mcp_tools:
+                            if tool["name"] == fn_name:
+                                loop = asyncio_new()
+                                tool_result = loop.run_until_complete(tool["handler"](fn_args))
+                                loop.close()
+                                break
+
+                    if tool_result is None:
+                        tool_result = json.dumps({"error": f"未知工具: {fn_name}"})
+
+                    add_log("AGENT", f"工具执行完成: {fn_name}", tool_result[:500])
+                    messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": tool_result})
+
+                # 循环继续——让 AI 基于工具结果生成下一轮回复（可能是最终文本或更多工具调用）
+        else:
+            emit("chat_response", {"role": "assistant", "content": assistant_content})
+
+    except Exception as e:
+        error_detail = str(e)
+        add_log("ERROR", "聊天处理异常", error_detail)
+        emit("chat_response", {"role": "assistant", "content": f"抱歉，处理您的消息时出现错误：{error_detail}"})
+
+
+@socketio.on("verify_response")
+def handle_verify_response(data):
+    """处理用户在 verify3 中的确认/拒绝响应"""
+    verify_id = data.get("verify_id")
+    approved = data.get("approved", False)
+    if verify_id in pending_verifications:
+        pending_verifications[verify_id]["approved"] = approved
+        pending_verifications[verify_id]["event"].set()
+        status = "已授权" if approved else "已拒绝"
+        add_log("AGENT", f"用户响应验证请求 {verify_id}: {status}")
+
+
+def asyncio_new():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def call_opencode(messages):
+    """调用 OpenCode Go API"""
+    api_key = OPENCODE_API_KEY
+    if not api_key:
+        return {"error": "未配置 OpenCode Go API Key，请在环境变量中设置 OPENCODE_API_KEY"}
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENCODE_MODEL,
+        "messages": messages,
+        "tools": mcp_tool_definitions if mcp_tool_definitions else None,
+        "tool_choice": "auto" if mcp_tool_definitions else None,
+    }
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(f"{OPENCODE_BASE_URL}/chat/completions", headers=headers, json=payload)
+            if response.status_code != 200:
+                return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
+
+            result = response.json()
+            choice = result["choices"][0]
+            message = choice["message"]
+
+            reasoning = message.get("content", "")
+            if message.get("tool_calls"):
+                fn_list = ", ".join([tc["function"]["name"] for tc in message["tool_calls"]])
+                if reasoning:
+                    reasoning += f" -> 调用 {fn_list}"
+                else:
+                    reasoning = f"调用 {fn_list}"
+            if reasoning:
+                add_log("AGENT", reasoning[:300])
+
+            return {"content": message.get("content", ""), "tool_calls": message.get("tool_calls", [])}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  AI 智能助手 v1.1")
+    print("  启动: http://127.0.0.1:18923")
+    print("=" * 50)
+    socketio.run(app, host="127.0.0.1", port=18923, debug=True, allow_unsafe_werkzeug=True)
