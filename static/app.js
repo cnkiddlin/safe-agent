@@ -6,12 +6,8 @@ let currentVerifyId = null;
 
 // ====== 页面加载时检查登录状态 ======
 document.addEventListener('DOMContentLoaded', () => {
-    // 检查是否刚从 verify2 跳转过来（携带 login=success 参数）
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('login') === 'success') {
-        // 尝试验证 session
-        checkAuthAndShowApp();
-    }
+    // 检查当前登录状态（从 OIDC Callback 重定向后会携带 session cookie）
+    checkAuthAndShowApp();
     // 自动高度调整
     const inp = document.getElementById('chatInput');
     if (inp) inp.addEventListener('input', function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px';});
@@ -33,8 +29,8 @@ async function checkAuthAndShowApp() {
 
 // ====== 登录（跳转到 IBM Verify 流程） ======
 async function handleLogin() {
-    // 跳转到 verify1 页面进行 passkey 验证
-    window.location.href = '/verify1';
+    // 跳转到后端 OIDC Login 端点，重定向到 IBM Verify SSO
+    window.location.href = '/api/login';
 }
 
 // ====== 初始化 ======

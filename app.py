@@ -7,11 +7,26 @@ from datetime import datetime
 
 import httpx
 import hvac
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, redirect
 from flask_socketio import SocketIO, emit
+import secrets
+import urllib.parse
+import hashlib
+import base64
+import jwt
+from jwt import PyJWKClient
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
+
+# Session Cookie 配置：确保跨域 OIDC 重定向能携带 cookie
+# Session Cookie 配置：本地 HTTP 开发环境关闭 Secure，确保 session 在 OIDC 重定向后仍能被浏览器传回
+app.config.update(
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_HTTPONLY=True,
+)
+
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ====== 配置 ======
@@ -19,36 +34,30 @@ OPENCODE_API_KEY = os.getenv("OPENCODE_API_KEY", "")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 OPENCODE_MODEL = "deepseek-v4-flash"
 
-# ====== 模拟用户数据（后续对接 OIDC） ======
-FAKE_USER = {
-    "acr": "urn:ibm:security:policy:id:1",
-    "active": True,
-    "app_id": "8397934368532187530",
-    "aud": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
-    "client_id": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
-    "exp": 1770913467,
-    "grant_id": "bf80ed7e-3904-408e-afab-521d373e8484",
-    "grant_type": "authorization_code",
-    "iat": 1770909866,
-    "iss": "https://demos.verify.ibm.com/oauth2",
-    "nbf": 1770909866,
-    "display_name": "张三",
-    "email": "San.Zhang@ibm.com",
-    "employee_id": "AA0001",
-    "lastest_login": "2026-07-03 14:21:06 UTC+8",
-    "status": "Active",
-    "scope": [
-        "email",
-        "agentic",
-        "openid",
-        "profile"
-    ],
-    "sub": "646004DF7C",
-    "token_type": "bearer",
-    "token_use": "access_token",
-    "uniqueSecurityName": "646004DF7C",
-    "userType": "FEDERATED"
-}
+# ====== IBM Verify OIDC SSO 配置 ======
+VERIFY_ISSUER = os.getenv("VERIFY_ISSUER", "https://order-platform-demo.verify.ibm.com")
+VERIFY_CLIENT_ID = os.environ["VERIFY_CLIENT_ID"]
+VERIFY_CLIENT_SECRET = os.environ["VERIFY_CLIENT_SECRET"]
+VERIFY_REDIRECT_URI = "http://localhost:18923/callback"
+VERIFY_SCOPE = "openid profile email"
+
+# OIDC endpoints (IBM Security Verify 标准路径)
+VERIFY_AUTH_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/authorize"
+VERIFY_TOKEN_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/token"
+VERIFY_JWKS_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/jwks"
+VERIFY_END_SESSION_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/end_session"
+
+# JWKS 客户端缓存（懒加载）
+_jwks_client = None
+
+
+def get_jwks_client():
+    """获取并缓存 JWKS 客户端"""
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(VERIFY_JWKS_ENDPOINT, cache_keys=True)
+    return _jwks_client
+
 
 # ====== Agent 日志 ======
 agent_logs = []
@@ -65,6 +74,28 @@ def add_log(level, message, detail=""):
     agent_logs.append(log_entry)
     socketio.emit("agent_log", log_entry)
     return log_entry
+
+
+# ====== OIDC State Store（服务端保存，避免跨域 Cookie 丢失问题） ======
+oidc_states = {}
+OIDC_STATE_TTL = 600  # 10 分钟过期
+
+
+def cleanup_oidc_states():
+    """定期清理过期的 OIDC state"""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        expired = [k for k, v in oidc_states.items()
+                   if now - v.get("created_at", 0) > OIDC_STATE_TTL]
+        for k in expired:
+            oidc_states.pop(k, None)
+        if expired:
+            add_log("AGENT", f"清理 {len(expired)} 个过期的 OIDC state")
+
+
+cleanup_thread = threading.Thread(target=cleanup_oidc_states, daemon=True)
+cleanup_thread.start()
 
 
 # ====== Agent Token Exchange 机制（OBO Token → Vault Token 兑换） ======
@@ -409,16 +440,6 @@ def index():
     return render_template("index.html", logged_in=bool(user))
 
 
-@app.route("/verify1")
-def verify1():
-    """IBM Verify 登录页面"""
-    return render_template("verify1.html")
-
-
-@app.route("/verify2")
-def verify2():
-    """IBM Verify 授权页面"""
-    return render_template("verify2.html")
 
 
 @app.route("/verify3")
@@ -427,24 +448,171 @@ def verify3():
     return render_template("verify3.html")
 
 
-@app.route("/api/login", methods=["POST"])
+@app.route("/api/login", methods=["GET"])
 def login():
-    """模拟 SSO 登录，无需账号密码"""
-    session["user"] = dict(FAKE_USER)
-    add_log("AGENT", f"用户登录: {FAKE_USER['display_name']}")
-    return jsonify({"success": True, "user": session["user"]})
+    """重定向到 IBM Verify SSO 登录页面（PKCE 授权码流程）"""
+    state = secrets.token_urlsafe(32)
+
+    # 生成 PKCE code_verifier 和 code_challenge
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge_digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(code_challenge_digest).rstrip(b"=").decode("ascii")
+
+    # 服务端保存 state + code_verifier（不依赖 Session Cookie）
+    oidc_states[state] = {
+        "code_verifier": code_verifier,
+        "created_at": time.time(),
+    }
+
+    params = {
+        "response_type": "code",
+        "client_id": VERIFY_CLIENT_ID,
+        "redirect_uri": VERIFY_REDIRECT_URI,
+        "scope": VERIFY_SCOPE,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "prompt": "login",   # 始终显示 Verify 登录页面，不自动使用已有 session
+    }
+    auth_url = f"{VERIFY_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    # 同时保存到 session 作为备份（Secure=False 后 session cookie 能跨同站点重定向保持）
+    session["oidc_state"] = state
+    session["oidc_code_verifier"] = code_verifier
+
+    add_log("AGENT", f"重定向到 IBM Verify SSO（state={state[:12]}...）")
+    return redirect(auth_url)
 
 
 @app.route("/api/logout", methods=["POST"])
 def logout():
-    session.pop("user", None)
+    """登出：清除本地 Session（未来可加入 Verify 端登出）"""
+    session.clear()
     return jsonify({"success": True})
 
 
 @app.route("/api/user", methods=["GET"])
 def get_user():
-    user = session.get("user", FAKE_USER)
-    return jsonify(user)
+    user = session.get("user")
+    if user:
+        return jsonify(user)
+    return jsonify({"error": "Not logged in"}), 401
+
+@app.route("/callback")
+def callback():
+    """OIDC 回调：使用授权码交换 Token 并创建用户会话"""
+    code = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        add_log("ERROR", f"IBM Verify SSO 登录失败: {error}")
+        return redirect("/?error=login_failed")
+
+    # 从服务端 state 存储中查找，先从 session 中取（更可靠，与浏览器绑定），再从全局字典取（兼容旧流程）
+    stored = None
+    if state:
+        sess_state = session.get("oidc_state")
+        sess_verifier = session.get("oidc_code_verifier")
+        if sess_state == state and sess_verifier:
+            stored = {"code_verifier": sess_verifier}
+            # 从 session 中清除
+            session.pop("oidc_state", None)
+            session.pop("oidc_code_verifier", None)
+            add_log("AGENT", "State 校验: 通过（session 匹配）")
+        else:
+            # 降级到服务端全局字典
+            stored = oidc_states.pop(state, None)
+            if stored:
+                add_log("AGENT", "State 校验: 通过（全局字典匹配）")
+            else:
+                add_log("AGENT", "State 校验: 失败（session 和全局字典均未找到 state）")
+    else:
+        add_log("AGENT", "State 校验: 跳过（未收到 state 参数）")
+
+    add_log("AGENT", f"OIDC 回调: code={code[:20] if code else 'N/A'}...")
+
+    if not code or not stored:
+        add_log("ERROR", "OAuth state 校验失败")
+        return redirect("/?error=invalid_state")
+
+    try:
+        # 用授权码交换 Token
+        code_verifier = stored["code_verifier"]
+        token_data = exchange_code_for_token(code, code_verifier)
+        id_token = token_data.get("id_token")
+        access_token = token_data.get("access_token")
+
+        if not id_token:
+            add_log("ERROR", "未收到 ID Token")
+            return redirect("/?error=no_id_token")
+
+        # 验证并解码 ID Token
+        user_claims = verify_id_token(id_token)
+
+        # 构建用户会话
+        session["user"] = {
+            "sub": user_claims.get("sub", ""),
+            "email": user_claims.get("email", ""),
+            "display_name": user_claims.get("name", "") or user_claims.get("display_name", "")
+                         or user_claims.get("preferred_username", ""),
+            "employee_id": user_claims.get("employee_id", "")
+                         or user_claims.get("AA_employeeID", ""),
+            "iss": user_claims.get("iss", ""),
+            "uniqueSecurityName": user_claims.get("uniqueSecurityName", "")
+                                 or user_claims.get("sub", ""),
+            "status": user_claims.get("status", "Active"),
+            "lastest_login": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC+8"),
+        }
+
+        # 保存 Token 供后续使用（如 OBO Token Exchange）
+        session["access_token"] = access_token
+        session["id_token"] = id_token
+
+        add_log("AGENT",
+                f"用户 SSO 登录成功: {session['user'].get('display_name', session['user'].get('sub', '未知'))}")
+        return redirect("/")
+
+    except Exception as e:
+        add_log("ERROR", f"OIDC 回调处理失败: {str(e)}")
+        return redirect("/?error=login_failed")
+
+def exchange_code_for_token(code, code_verifier=""):
+    """用授权码交换 Access Token 和 ID Token（支持 PKCE）"""
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": VERIFY_REDIRECT_URI,
+        "client_id": VERIFY_CLIENT_ID,
+        "client_secret": VERIFY_CLIENT_SECRET,
+    }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(VERIFY_TOKEN_ENDPOINT, data=data, headers=headers)
+        if resp.status_code != 200:
+            raise Exception(
+                f"Token exchange failed: HTTP {resp.status_code} - {resp.text[:500]}"
+            )
+        return resp.json()
+
+
+def verify_id_token(id_token):
+    """通过 JWKS 验证 ID Token 的签名并返回 claims"""
+    jwks_client = get_jwks_client()
+    signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+
+    claims = jwt.decode(
+        id_token,
+        signing_key.key,
+        algorithms=["RS256"],
+        audience=VERIFY_CLIENT_ID,
+        issuer=f"{VERIFY_ISSUER}/oauth2",
+        options={"verify_exp": True},
+    )
+    return claims
+
 
 
 @app.route("/api/check-auth", methods=["GET"])
@@ -456,11 +624,6 @@ def check_auth():
     return jsonify({"logged_in": False})
 
 
-@app.route("/api/verify-passkey", methods=["POST"])
-def verify_passkey():
-    """模拟 passkey 服务器端验证"""
-    # 在实际应用中，这里会验证 WebAuthn 签名
-    return jsonify({"success": True, "verified": True})
 
 
 @app.route("/api/mcp/tools", methods=["GET"])
@@ -515,7 +678,7 @@ def clear_agent_logs():
 
 @socketio.on("chat_message")
 def handle_chat_message(data):
-    user = session.get("user", FAKE_USER)
+    user = session.get("user", {})
     user_message = data.get("message", "")
     history = data.get("history", [])
 
