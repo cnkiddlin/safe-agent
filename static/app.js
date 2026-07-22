@@ -6,6 +6,16 @@ let currentVerifyId = null;
 
 // ====== 页面加载时检查登录状态 ======
 document.addEventListener('DOMContentLoaded', () => {
+    // 确保右侧面板默认关闭
+    const panel = document.getElementById('sidePanel');
+    if (panel) {
+        panel.classList.remove('open');
+        panel.style.removeProperty('width');
+        ['mcpPanel','logPanel','userPanel'].forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+    }
     // 检查当前登录状态（从 OIDC Callback 重定向后会携带 session cookie）
     checkAuthAndShowApp();
     // 自动高度调整
@@ -192,15 +202,56 @@ function togglePanel(id) {
     const t = document.getElementById(id);
     if (panel.classList.contains("open") && t.style.display !== "none") {
         panel.classList.remove("open");
+        panel.style.removeProperty("width");
         all.forEach(p => document.getElementById(p).style.display = "none");
         return;
     }
     all.forEach(p => document.getElementById(p).style.display = p === id ? "flex" : "none");
     panel.classList.add("open");
+    const savedWidth = localStorage.getItem("sidePanelWidth");
+    if (savedWidth) {
+        panel.style.width = savedWidth;
+    }
 }
 function toggleMCP() { togglePanel("mcpPanel"); }
 function toggleLogs() { togglePanel("logPanel"); }
 function toggleUserInfo() { loadUserInfo(); togglePanel("userPanel"); }
+
+// ====== 侧面板拖拽缩放 ======
+(function initPanelResize() {
+    const panel = document.getElementById("sidePanel");
+    const handle = document.getElementById("panelResizeHandle");
+    if (!panel || !handle) return;
+
+    // 只在 togglePanel 打开面板时恢复保存的宽度，此处不设置以免面板默认打开
+    let isResizing = false;
+
+    handle.addEventListener("mousedown", (e) => {
+        isResizing = true;
+        panel.classList.add("resizing");
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+        handle.classList.add("active");
+        e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+        if (!isResizing) return;
+        const panelWidth = window.innerWidth - e.clientX;
+        const clampedWidth = Math.max(280, Math.min(1000, panelWidth));
+        panel.style.width = clampedWidth + "px";
+    });
+
+    document.addEventListener("mouseup", () => {
+        if (!isResizing) return;
+        isResizing = false;
+        panel.classList.remove("resizing");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        handle.classList.remove("active");
+        localStorage.setItem("sidePanelWidth", panel.style.width);
+    });
+})();
 
 // ====== MCP ======
 async function loadMCPTools() {
@@ -257,6 +308,7 @@ async function deleteMCPTool(name) {
 
 // ====== 日志 ======
 function appendLog(e) {
+    console.log(`[${e.level}] ${e.message}${e.detail ? " | " + e.detail : ""}`);
     const list = document.getElementById("logList");
     const d = document.createElement("div"); d.className = "log-entry";
     d.onclick = function(){this.classList.toggle("expanded")};

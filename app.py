@@ -46,6 +46,10 @@ VERIFY_AUTH_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/authorize"
 VERIFY_TOKEN_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/token"
 VERIFY_JWKS_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/jwks"
 VERIFY_END_SESSION_ENDPOINT = f"{VERIFY_ISSUER}/oauth2/end_session"
+# ====== Vault 配置 ======
+VAULT_ADDR = os.getenv("VAULT_ADDR", "http://127.0.0.1:8200")
+VAULT_ROLE_ID = os.getenv("VAULT_ROLE_ID") or os.getenv("agent_role_id") or ""
+VAULT_SECRET_ID = os.getenv("VAULT_SECRET_ID") or os.getenv("agent_secret_id") or ""
 
 # JWKS 客户端缓存（懒加载）
 _jwks_client = None
@@ -115,27 +119,161 @@ obo_token_cache = {
 }
 OBO_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
 
+# Agent Vault Token 缓存（用于 Agent 自身的 Vault AppRole 登录）
+agent_vault_token_cache = {"token": None, "cached_at": 0.0, "expires_at": 0.0}
+AGENT_VAULT_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
 
-def get_verify_client_credential_from_vault():
-    """从 Vault 获取预先存放的 Verify Client Credential（Demo 模拟模式）"""
-    time.sleep(0.5)
-    credential = {
-        "client_id": "fb3951ec-4755-4c63-9d6a-c68df2b98620",
-        "client_secret": f"mock-secret-{uuid.uuid4().hex[:16]}",
-    }
-    add_log("AGENT", f"从 Vault 获取 Verify Client Credential",
-            f"client_id: {credential['client_id']}")
-    add_log("AGENT", "Verify Client Credential 获取成功")
-    return credential
+# Agent Verify Token (act_token) 缓存
+agent_verify_token_cache = {"token": None, "cached_at": 0.0, "expires_at": 0.0}
+AGENT_VERIFY_TOKEN_CACHE_TTL = 300  # 5 分钟缓存
 
 
-def exchange_to_obo_token(client_credential):
-    """用 Verify Client Credential 向 Verify 发起 OBO Token Exchange（Demo 模拟模式）"""
-    time.sleep(0.8)
-    obo_token = f"obo-token-{uuid.uuid4().hex[:16]}"
-    add_log("AGENT", f"执行 Token Exchange，获取 OBO Token",
-            f"TTL {OBO_TOKEN_CACHE_TTL // 60} 分钟")
-    return obo_token
+def agent_vault_login():
+    """Agent 使用自身的 role_id 和 secret_id 登录 Vault（AppRole 认证）"""
+    add_log("AGENT", f"Step 1 — Agent Vault AppRole 登录（role_id={VAULT_ROLE_ID[:12]}...）")
+    print("\n[TOKEN_EXCHANGE] ====== Step 1: Agent Vault AppRole Login ======")
+    print(f"[TOKEN_EXCHANGE]   VAULT_ADDR  : {VAULT_ADDR}")
+    print(f"[TOKEN_EXCHANGE]   role_id     : {VAULT_ROLE_ID[:20]}...")
+    client = hvac.Client(url=VAULT_ADDR)
+    login_response = client.auth.approle.login(
+        role_id=VAULT_ROLE_ID,
+        secret_id=VAULT_SECRET_ID,
+    )
+    vault_token = login_response["auth"]["client_token"]
+    print(f"[TOKEN_EXCHANGE]   agent_vault_token: {vault_token}")
+    add_log("AGENT", f"Step 1 — Agent Vault 登录成功，token={vault_token[:20]}...")
+    print("[TOKEN_EXCHANGE] ====== Step 1 Done ======\n")
+    return vault_token
+
+
+def ensure_agent_vault_token() -> str:
+    """获取 Agent 自身的 Vault Token，优先使用缓存"""
+    now = time.time()
+    cached = agent_vault_token_cache["token"]
+    expires = agent_vault_token_cache["expires_at"]
+    if cached and expires > now:
+        remaining = int(expires - now)
+        add_log("AGENT", f"Agent Vault Token 缓存命中（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] Agent Vault Token 缓存命中（剩余 {remaining}s）: {cached[:30]}...")
+        return cached
+    vault_token = agent_vault_login()
+    agent_vault_token_cache["token"] = vault_token
+    agent_vault_token_cache["cached_at"] = now
+    agent_vault_token_cache["expires_at"] = now + AGENT_VAULT_TOKEN_CACHE_TTL
+    add_log("AGENT", f"Agent Vault Token 已缓存（TTL {AGENT_VAULT_TOKEN_CACHE_TTL // 60} 分钟）")
+    return vault_token
+
+
+def read_verify_creds_from_vault(vault_token):
+    """从 Vault secret/verify 读取 Verify 客户端凭证（KV v1）"""
+    add_log("AGENT", "Step 2 — 从 Vault 读取 Verify 客户端凭证")
+    print("\n[TOKEN_EXCHANGE] ====== Step 2: Read Verify Credentials from Vault ======")
+    client = hvac.Client(url=VAULT_ADDR, token=vault_token)
+    try:
+        response = client.secrets.kv.v1.read_secret(
+            mount_point="secret",
+            path="verify",
+        )
+        data = response["data"]
+        creds = {
+            "agent_client_id": data["agent_client_id"],
+            "agent_client_secret": data["agent_client_secret"],
+            "sts_client_id": data["sts_client_id"],
+            "sts_client_secret": data["sts_client_secret"],
+        }
+        print(f"[TOKEN_EXCHANGE]   agent_client_id : {creds['agent_client_id']}")
+        print(f"[TOKEN_EXCHANGE]   sts_client_id   : {creds['sts_client_id']}")
+        add_log("AGENT", f"Step 2 — Verify 凭证读取成功（agent_client_id={creds['agent_client_id'][:12]}..., sts_client_id={creds['sts_client_id'][:12]}...）")
+        print("[TOKEN_EXCHANGE] ====== Step 2 Done ======\n")
+        return creds
+    except Exception as e:
+        add_log("ERROR", f"Step 2 — 读取 Verify 凭证失败: {e}")
+        print(f"[TOKEN_EXCHANGE]   ERROR: {e}")
+        raise
+
+
+def agent_verify_login(client_id, client_secret):
+    """Agent 使用客户端凭证登录 Verify，获取 act_token"""
+    add_log("AGENT", f"Step 3 — Agent Verify Client Credentials 登录（client_id={client_id[:12]}...）")
+    print("\n[TOKEN_EXCHANGE] ====== Step 3: Agent Verify Login (Client Credentials) ======")
+    print(f"[TOKEN_EXCHANGE]   client_id : {client_id}")
+    print(f"[TOKEN_EXCHANGE]   endpoint  : {VERIFY_ISSUER}/v1.0/endpoint/default/token")
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{VERIFY_ISSUER}/v1.0/endpoint/default/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        print(f"[TOKEN_EXCHANGE]   HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[TOKEN_EXCHANGE]   ERROR: {resp.text[:500]}")
+            raise Exception(f"Agent Verify 登录失败: HTTP {resp.status_code} - {resp.text[:500]}")
+        act_token = resp.json()["access_token"]
+        print(f"[TOKEN_EXCHANGE]   act_token: {act_token}")
+        add_log("AGENT", f"Step 3 — Agent Verify 登录成功，act_token={act_token[:20]}...")
+        print("[TOKEN_EXCHANGE] ====== Step 3 Done ======\n")
+        return act_token
+
+
+def ensure_agent_verify_token(client_id, client_secret) -> str:
+    """获取 Agent 的 Verify Token（act_token），优先使用缓存"""
+    now = time.time()
+    cached = agent_verify_token_cache["token"]
+    expires = agent_verify_token_cache["expires_at"]
+    if cached and expires > now:
+        remaining = int(expires - now)
+        add_log("AGENT", f"Agent Verify Token 缓存命中（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] Agent Verify Token 缓存命中（剩余 {remaining}s）: {cached[:30]}...")
+        return cached
+    act_token = agent_verify_login(client_id, client_secret)
+    agent_verify_token_cache["token"] = act_token
+    agent_verify_token_cache["cached_at"] = now
+    agent_verify_token_cache["expires_at"] = now + AGENT_VERIFY_TOKEN_CACHE_TTL
+    return act_token
+
+
+def exchange_to_obo_token(sub_token, act_token, sts_client_id, sts_client_secret):
+    """通过 Token Exchange 获取 OBO Token"""
+    add_log("AGENT", f"Step 4 — Token Exchange（sts_client_id={sts_client_id[:12]}...）")
+    print("\n[TOKEN_EXCHANGE] ====== Step 4: Token Exchange (OBO) ======")
+    print(f"[TOKEN_EXCHANGE]   sub_token      : {sub_token}")
+    print(f"[TOKEN_EXCHANGE]   act_token      : {act_token}")
+    print(f"[TOKEN_EXCHANGE]   sts_client_id  : {sts_client_id}")
+    print(f"[TOKEN_EXCHANGE]   endpoint       : {VERIFY_ISSUER}/oauth2/token")
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{VERIFY_ISSUER}/oauth2/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": sub_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "actor_token": act_token,
+                "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "client_id": sts_client_id,
+                "client_secret": sts_client_secret,
+                "authorization_details": json.dumps([
+                    {
+                        "type": "vault:path_access",
+                        "path": "secret-v2/data/shared-secret/foo",
+                        "capabilities": ["create"],
+                    }
+                ]),
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        print(f"[TOKEN_EXCHANGE]   HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[TOKEN_EXCHANGE]   ERROR: {resp.text[:500]}")
+            raise Exception(f"Token Exchange 失败: HTTP {resp.status_code} - {resp.text[:500]}")
+        obo_token = resp.json()["access_token"]
+        print(f"[TOKEN_EXCHANGE]   obo_token: {obo_token}")
+        add_log("AGENT", f"Step 4 — Token Exchange 成功，OBO Token={obo_token[:20]}...")
+        print("[TOKEN_EXCHANGE] ====== Step 4 Done ======\n")
+        return obo_token
 
 
 def ensure_obo_token() -> str:
@@ -147,6 +285,7 @@ def ensure_obo_token() -> str:
     if cached and expires > now:
         remaining = int(expires - now)
         add_log("AGENT", f"OBO Token 缓存命中，直接复用（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] OBO Token 缓存命中（剩余 {remaining}s）: {cached[:30]}...")
         return cached
 
     # 2. 检查 Session 缓存（跨请求持久化，防止 reloader 重启丢失）
@@ -158,10 +297,42 @@ def ensure_obo_token() -> str:
         obo_token_cache["expires_at"] = sess_expires
         remaining = int(sess_expires - now)
         add_log("AGENT", f"OBO Token Session 缓存命中，直接复用（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] OBO Token Session 缓存命中（剩余 {remaining}s）: {sess_obo_token[:30]}...")
         return sess_obo_token
 
-    credential = get_verify_client_credential_from_vault()
-    obo_token = exchange_to_obo_token(credential)
+    # 3. Agent 登录 Vault（AppRole）获取 agent_vault_token
+    add_log("AGENT", "=== Step 1/5: Agent Vault AppRole 登录 ===")
+    print("\n[TOKEN_EXCHANGE] ********** TOKEN EXCHANGE FULL FLOW START **********")
+    agent_vault_token = ensure_agent_vault_token()
+
+    # 4. 从 Vault 读取 Verify 凭证
+    add_log("AGENT", "=== Step 2/5: 读取 Verify 凭证 ===")
+    verify_creds = read_verify_creds_from_vault(agent_vault_token)
+
+    # 5. Agent 登录 Verify（Client Credentials）获取 act_token
+    add_log("AGENT", "=== Step 3/5: Agent Verify 登录 ===")
+    act_token = ensure_agent_verify_token(
+        verify_creds["agent_client_id"],
+        verify_creds["agent_client_secret"],
+    )
+
+    # 6. 获取用户的 access_token（sub_token）
+    sub_token = session.get("access_token", "")
+    if not sub_token:
+        raise Exception("用户 access_token 未找到，请重新登录 SSO")
+
+    # 7. 执行 Token Exchange 获取 OBO Token
+    add_log("AGENT", f"=== Step 4/5: Token Exchange（sub_token={sub_token[:20]}...） ===")
+    print(f"\n[TOKEN_EXCHANGE] ====== Token Exchange Parameters ======")
+    print(f"[TOKEN_EXCHANGE]   sub_token (user) : {sub_token}")
+    print(f"[TOKEN_EXCHANGE]   act_token (agent): {act_token}")
+    print(f"[TOKEN_EXCHANGE]   sts_client_id    : {verify_creds['sts_client_id']}")
+    obo_token = exchange_to_obo_token(
+        sub_token,
+        act_token,
+        verify_creds["sts_client_id"],
+        verify_creds["sts_client_secret"],
+    )
 
     now = time.time()
     obo_token_cache["token"] = obo_token
@@ -176,14 +347,29 @@ def ensure_obo_token() -> str:
     return obo_token
 
 
-def get_app_secret_key(vault_token: str = ""):
-    """获取应用秘钥（Demo 模拟模式）"""
-    time.sleep(0.3)
-    app_secret = f"app-secret-{uuid.uuid4().hex[:16]}"
-    return {
-        "status": "SUCCESS",
-        "app_secret_key": app_secret,
-    }
+def obo_to_vault_token(obo_token):
+    """使用 OBO Token 通过 Vault JWT 认证获取 Vault Token"""
+    add_log("AGENT", "Step 5 — OBO -> Vault JWT 认证")
+    print("\n[TOKEN_EXCHANGE] ====== Step 5: OBO -> Vault JWT Login ======")
+    print(f"[TOKEN_EXCHANGE]   obo_token     : {obo_token}")
+    print(f"[TOKEN_EXCHANGE]   vault endpoint: {VAULT_ADDR}/v1/auth/jwt/login")
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(
+            f"{VAULT_ADDR}/v1/auth/jwt/login",
+            data={
+                "role": "verify",
+                "jwt": obo_token,
+            },
+        )
+        print(f"[TOKEN_EXCHANGE]   HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            print(f"[TOKEN_EXCHANGE]   ERROR: {resp.text[:500]}")
+            raise Exception(f"OBO -> Vault 登录失败: HTTP {resp.status_code} - {resp.text[:500]}")
+        vault_token = resp.json()["auth"]["client_token"]
+        print(f"[TOKEN_EXCHANGE]   vault_token (from OBO JWT): {vault_token}")
+        add_log("AGENT", f"Step 5 — OBO -> Vault JWT 成功，vault_token={vault_token[:20]}...")
+        print("[TOKEN_EXCHANGE] ====== Step 5 Done ======\n")
+        return vault_token
 
 
 def ensure_vault_token() -> str:
@@ -195,6 +381,7 @@ def ensure_vault_token() -> str:
     if cached and expires > now:
         remaining = int(expires - now)
         add_log("AGENT", f"Vault Token 缓存命中，直接复用（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] Vault Token 缓存命中（剩余 {remaining}s）: {cached[:30]}...")
         return cached
 
     # 2. 检查 Session 缓存（跨请求持久化，防止 reloader 重启丢失）
@@ -206,18 +393,20 @@ def ensure_vault_token() -> str:
         vault_token_cache["expires_at"] = sess_expires
         remaining = int(sess_expires - now)
         add_log("AGENT", f"Vault Token Session 缓存命中，直接复用（剩余 {remaining}s）")
+        print(f"[TOKEN_CACHE] Vault Token Session 缓存命中（剩余 {remaining}s）: {sess_vault_token[:30]}...")
         return sess_vault_token
 
-    add_log("AGENT", "未检测到 OBO Token 和 Vault Token 的缓存")
+    add_log("AGENT", "=== 全流程：开始 Token Exchange 并获取 Vault Token ===")
 
     # 确保 OBO Token 可用
     obo_token = ensure_obo_token()
 
-    # 用 OBO Token 向 Vault 进行身份验证
-    time.sleep(0.5)
-    vault_token = f"vault-token-{uuid.uuid4().hex[:16]}"
-    add_log("AGENT", "使用 OBO Token 通过 Vault 身份验证")
-    add_log("AGENT", f"Vault Token 已缓存（TTL {VAULT_TOKEN_CACHE_TTL // 60} 分钟）")
+    print(f"\n[TOKEN_EXCHANGE] ====== OBO Token obtained ======")
+    print(f"[TOKEN_EXCHANGE]   obo_token: {obo_token}")
+
+    # 用 OBO Token 向 Vault 进行 JWT 身份验证
+    add_log("AGENT", "=== Step 5/5: OBO -> Vault JWT 认证 ===")
+    vault_token = obo_to_vault_token(obo_token)
 
     now = time.time()
     vault_token_cache["token"] = vault_token
@@ -229,10 +418,12 @@ def ensure_vault_token() -> str:
     session["vault_token_cached_at"] = now
     session["vault_token_expires_at"] = now + VAULT_TOKEN_CACHE_TTL
 
-    # 获取应用秘钥
-    get_app_secret_key(vault_token)
-
+    print(f"[TOKEN_EXCHANGE] ********** TOKEN EXCHANGE FULL FLOW COMPLETE **********")
+    print(f"[TOKEN_EXCHANGE]   Final vault_token: {vault_token}")
     return vault_token
+
+
+
 
 
 # ====== MCP 工具注册 ======
@@ -298,36 +489,36 @@ MCP_ORDER_SERVER_URL = "http://127.0.0.1:18724"
 
 
 def get_api_token_from_vault(operation_name: str, vault_token: str = ""):
-    """从 Vault 获取指定操作类型的 API Token——通过 Vault Token 认证（Demo 模式）"""
-    vault_addr = 'http://127.0.0.1:8200'
-    # Demo 模式：内部使用预先配置的 Vault Token 连接真实 Vault
-    demo_vault_token = os.getenv("VAULT_TOKEN", "<your-vault-token>")
-
+    """从 Vault 获取指定操作类型的 API Token（KV v1）"""
     if operation_name not in ("get", "delete"):
         return {"status": "FAILED", "message": "operation_name 必须是 'get' 或 'delete'"}
-
-    add_log("AGENT", f"准备从 Vault 获取 API Token ( {operation_name.upper()} 操作)")
-
-    client = hvac.Client(url=vault_addr, token=demo_vault_token)
-    if not client.is_authenticated():
-        add_log("ERROR", "Vault 身份验证失败")
-        return {"status": "FAILED", "message": "Failed to authenticate with Vault"}
-
+    path_map = {"get": "query", "delete": "delete"}
+    sub_path = path_map[operation_name]
+    add_log("AGENT", f"Step 6 — 从 Vault secret/order/{sub_path} 获取 API Token（{operation_name.upper()} 操作）")
+    print(f"\n[TOKEN_EXCHANGE] ====== Step 6: Read API Token from Vault ======")
+    print(f"[TOKEN_EXCHANGE]   vault_token : {vault_token}")
+    print(f"[TOKEN_EXCHANGE]   path        : secret/order/{sub_path}")
+    print(f"[TOKEN_EXCHANGE]   key         : {operation_name}_api_token")
     try:
+        client = hvac.Client(url=VAULT_ADDR, token=vault_token)
         response = client.secrets.kv.v1.read_secret(
             mount_point="secret",
-            path=f"order/user_zhangsan/{operation_name}",
+            path=f"order/{sub_path}",
         )
-        api_token = response["data"][f"{operation_name}_api_token"]
-        add_log("AGENT", f"获取 API Token（ {operation_name.upper()} 操作）")
-        return {
-            "status": "SUCCESS",
-            "operation": operation_name,
-            "api_token": api_token,
-        }
+        # 打印 Vault 返回的完整 data 结构
+        print(f"[TOKEN_EXCHANGE]   raw_data    : {response['data']}")
+        api_token = response["data"].get("api_token", "")
+        if not api_token:
+            raise KeyError(f"在返回数据中未找到 api_token，可用 keys: {list(response['data'].keys())}")
+        print(f"[TOKEN_EXCHANGE]   api_token   : {api_token}")
+        add_log("AGENT", f"Step 6 — API Token 获取成功（{len(api_token)} 字符）")
+        print("[TOKEN_EXCHANGE] ====== Step 6 Done ======\n")
+        return {"status": "SUCCESS", "operation": operation_name, "api_token": api_token}
     except Exception as e:
-        add_log("ERROR", f"读取 Vault Secret 失败: {e}")
-        return {"status": "FAILED", "message": f"Failed to read secret: {str(e)}"}
+        add_log("ERROR", f"Step 6 — 读取 Vault Secret 失败: {e}")
+        print(f"[TOKEN_EXCHANGE]   ERROR: {e}")
+        print("[TOKEN_EXCHANGE] ====== Step 6 Failed ======\n")
+        return {"status": "FAILED", "message": str(e)}
 
 
 async def _handle_get_api_token(args):
@@ -541,6 +732,7 @@ def callback():
         token_data = exchange_code_for_token(code, code_verifier)
         id_token = token_data.get("id_token")
         access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token", "")
 
         if not id_token:
             add_log("ERROR", "未收到 ID Token")
@@ -567,6 +759,18 @@ def callback():
         # 保存 Token 供后续使用（如 OBO Token Exchange）
         session["access_token"] = access_token
         session["id_token"] = id_token
+        session["refresh_token"] = refresh_token
+
+        # 后端打印三个 SSO token 方便调试
+        print("[SSO TOKENS] ====== begin ======")
+        print(f"[SSO TOKENS]   access_token : {access_token}")
+        print(f"[SSO TOKENS]   id_token     : {id_token}")
+        print(f"[SSO TOKENS]   refresh_token: {refresh_token}")
+        print("[SSO TOKENS] ======  end  ======")
+        add_log("AGENT", "SSO Token 获取完成",
+                f"access_token={access_token[:40] if access_token else 'N/A'}... | "
+                f"refresh_token={'YES' if refresh_token else 'N/A'} | "
+                f"id_token={id_token[:40] if id_token else 'N/A'}...")
 
         add_log("AGENT",
                 f"用户 SSO 登录成功: {session['user'].get('display_name', session['user'].get('sub', '未知'))}")

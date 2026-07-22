@@ -90,7 +90,7 @@ def list_orders():
     api_token = request.args.get("api_token", "")
 
     # 验证 api_token
-    if api_token != 'f47ac10b-58cc-4372-a567-0e02b2c3d479':
+    if api_token != 'QUERY_API_TOKEN_DEMO_123456':
         return {'error': 'Invalid API token'}
 
     # 支持可选的状态过滤
@@ -106,7 +106,7 @@ def delete_order(order_id):
     """删除指定订单"""
     api_token = request.args.get("api_token", "")
     # 验证 api_token
-    if api_token != 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d':
+    if api_token != 'DELETE_API_TOKEN_DEMO_123456':
         return {'error': 'Invalid API token'}
 
     # 删除订单

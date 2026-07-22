@@ -1,135 +1,220 @@
-# Safe Agent - AI 订单助手
+# Safe Agent — AI 订单助手
 
-基于 Flask + WebSocket 的 AI 订单管理助手，集成以下企业级安全能力：
+基于 **Flask + WebSocket + DeepSeek** 的智能订单管理助手，集成企业级安全认证与令牌兑换链路：
 
-- **IBM Verify OIDC SSO 认证** — 对接真实 IBM Security Verify，支持 PKCE 授权码流程
-- **HashiCorp Vault 密钥管理** — 在 Vault 中存储 API Token、Client Credential、应用秘钥
-- **OBO Token → Vault Token 兑换机制** — 两层 Token 缓存（内存 + Session），模拟企业级安全凭证交换
-- **OpenCode AI (DeepSeek)** 大语言模型驱动的智能对话交互
-
-## 功能概述
-
-- **AI 对话** — 通过 OpenCode AI (DeepSeek) 模型进行订单查询、修改与删除等自然语言交互
-- **IBM Verify SSO 登录** — 真实 OIDC 授权码 + PKCE 流程，重定向到 IBM Verify 完成身份认证
-- **OBO Token → Vault Token 兑换** — 模拟 Verify Client Credential → OBO Token → Vault Token → 应用秘钥的完整安全链
-- **多级 Token 缓存** — 内存缓存 + Flask Session 持久化，防止 dev reloader 重启导致 Token 丢失
-- **Vault 密钥管理** — 模拟 Vault 存储和获取 API Token、Client Credential、应用秘钥
-- **订单管理 API** — 独立的 MCP 订单服务，提供 RESTful 订单 CRUD 接口
-- **实时通信** — 基于 Flask-SocketIO 实现 WebSocket 双向消息推送
-- **敏感操作确认** — 删除订单等高风险操作需要用户明确授权（IBM Verify 风格弹窗确认）
+- **IBM Verify OIDC SSO 认证** — 真实对接 IBM Security Verify，PKCE 授权码流程
+- **IBM Verify Token Exchange** — 真实 OBO（On-Behalf-Of）令牌兑换，打通 Verify → Vault 安全链
+- **HashiCorp Vault 密钥管理** — Agent 通过 AppRole 登录 Vault 读取凭证，OBO Token 登录 Vault 获取应用 API Token
+- **多级 Token 缓存** — 内存 + Session 双层缓存，避免重复兑换，支持 TTL 自动过期
+- **OpenCode AI (DeepSeek)** 大语言模型驱动的自然语言交互
 
 ## 项目结构
 
 ```
 safe-agent/
-├── app.py                 # 主应用 — Flask Web 服务 + AI 对话路由
-├── mcp_order_server.py    # MCP 订单管理服务
-├── requirements.txt       # Python 依赖清单
-├── templates/             # Jinja2 模板
-│   ├── index.html         # 订单助手主页面
-│   └── verify3.html       # 敏感操作授权确认面板（可嵌入 iframe）
-├── static/                # 静态资源
-│   ├── app.js             # 前端交互逻辑（聊天、授权、确认弹窗）
-│   ├── style.css          # 样式文件（亮色/暗色主题）
-│   └── favicon.svg        # 网站图标（订单盒图标）
-├── vault/                 # Vault 配置
-│   ├── vault.hcl          # Vault 服务配置
-│   └── keys.txt           # （本地敏感文件，不提交）
-└── venv/                  # Python 虚拟环境（本地）
+├── app.py                    # 主应用 — Flask Web 服务 + Token Exchange + AI 对话
+├── mcp_order_server.py       # MCP 订单管理服务（订单 CRUD）
+├── requirements.txt          # Python 依赖
+├── templates/
+│   ├── index.html            # 订单助手主页面（聊天 + 侧面板）
+│   └── verify3.html          # 敏感操作授权确认面板（iframe 嵌入）
+├── static/
+│   ├── app.js                # 前端交互（聊天、面板拖拽、授权弹窗、日志）
+│   ├── style.css             # 样式文件
+│   └── favicon.svg           # 网站图标
+└── vault/
+    ├── admin.hcl             # Vault Admin 策略配置
+    ├── agent.hcl             # Vault Agent AppRole 策略（secret/verify 读权限）
+    ├── orders-read.hcl       # Vault 订单读取策略（secret/order/* 读权限）
+    └── keys.txt              # （敏感文件，已 .gitignore，不提交）
 ```
+
+## 安全凭证交换流程
+
+完整的 Token Exchange 链路，每次用户对话自动执行（缓存命中时跳过）：
+
+```
+用户 SSO 登录
+    │
+    ▼
+access_token (sub_token)  ← 本地缓存
+    │
+    ▼
+Agent Vault AppRole 登录
+    ├─ role_id + secret_id → login → agent_vault_token  ← 缓存 TTL 300s
+    │
+    ▼
+从 Vault secret/verify 读取凭证
+    ├─ agent_client_id / agent_client_secret
+    └─ sts_client_id / sts_client_secret
+    │
+    ▼
+Agent Verify Client Credentials 登录
+    ├─ agent_client_id + agent_client_secret → login → act_token  ← 缓存 TTL 300s
+    │
+    ▼
+Token Exchange (OBO)
+    ├─ subject_token = sub_token (用户)
+    ├─ actor_token   = act_token (Agent)
+    └─ → obo_token  ← 缓存 TTL 300s（内存 + Session）
+    │
+    ▼
+OBO → Vault JWT 登录
+    ├─ jwt = obo_token, role = "verify"
+    └─ → vault_token  ← 缓存 TTL 300s（内存 + Session）
+    │
+    ▼
+从 Vault secret/order/{query,delete} 读取 API Token
+    └─ → api_token → 执行业务操作
+```
+
+### 缓存策略
+
+| 缓存项 | 存储 | TTL | 命中时后端日志 |
+|--------|------|-----|---------------|
+| `agent_vault_token` | 内存 | 300s | `[TOKEN_CACHE] Agent Vault Token 缓存命中` |
+| `agent_verify_token` (act_token) | 内存 | 300s | `[TOKEN_CACHE] Agent Verify Token 缓存命中` |
+| `obo_token` | 内存 + Session | 300s | `[TOKEN_CACHE] OBO Token 缓存命中` |
+| `obo_token` (Session 恢复) | Session → 内存 | 300s | `[TOKEN_CACHE] OBO Token Session 缓存命中` |
+| `vault_token` | 内存 + Session | 300s | `[TOKEN_CACHE] Vault Token 缓存命中` |
+| `vault_token` (Session 恢复) | Session → 内存 | 300s | `[TOKEN_CACHE] Vault Token Session 缓存命中` |
+
+> 所有缓存项在过期后自动从上游重新兑换，Session 缓存用于在 dev reloader 重启后恢复令牌。
+
+## 功能
+
+- **AI 对话** — 通过 DeepSeek 模型自然语言查询、管理订单
+- **IBM Verify SSO 登录** — 真实 OIDC 授权码 + PKCE 流程
+- **真实 Token Exchange** — GET / POST 到 Verify token 端点兑换 OBO Token
+- **Agent 日志面板** — 右侧面板实时展示每一步 Token Exchange 的详细日志，支持展开/折叠和滚动查看
+- **Vault 密钥管理** — 真实 Vault AppRole 登录 + OBO Token JWT 认证
+- **敏感操作确认** — 删除订单等高危操作通过 IBM Verify 风格弹窗授权
+- **订单管理 API** — 独立的 MCP 订单服务（CRUD）
+- **多级缓存** — 内存 + Session 双层缓存，避免重复的 Token Exchange 和 Vault 登录
 
 ## 快速开始
 
 ### 前置条件
 
 - Python 3.10+
-- HashiCorp Vault（可选，用于密钥管理）
+- HashiCorp Vault（本地运行，端口 8200）
+- IBM Verify 应用（用于 SSO 登录和 Token Exchange）
 
-### 安装与运行
+### 安装
 
 ```bash
+cd safe-agent
 python3 -m venv venv
 source venv/bin/activate
-
-# 2. 安装依赖
 pip install -r requirements.txt
-
-# 3. 设置环境变量
-export OPENCODE_API_KEY="your-api-key"
-
-# 4. 启动主应用（默认端口 18923）
-python app.py          # → http://127.0.0.1:18923
-
-# 5. （可选）启动 MCP 订单服务（默认端口 5001）
-python mcp_order_server.py
 ```
 
-> **注意**：应用默认运行在 `127.0.0.1:18923`，如果端口被占用可修改 `app.py` 中的 `port` 参数。
+### 环境变量
 
-### SSO 登录流程
+| 变量 | 说明 | 示例 / 默认值 | 必填 |
+|------|------|---------------|------|
+| `OPENCODE_API_KEY` | OpenCode AI (DeepSeek) API 密钥 | `sk-...` | 是 |
+| `VERIFY_ISSUER` | IBM Verify 签发地址 | `https://order-platform-demo.verify.ibm.com` | 否 |
+| `VERIFY_CLIENT_ID` | OIDC 应用客户端 ID（SSO 登录用） | `4b51b9d8-...` | 是 |
+| `VERIFY_CLIENT_SECRET` | OIDC 应用客户端密钥 | `wSjMSRSg...` | 是 |
+| `VAULT_ADDR` | Vault 服务地址 | `http://127.0.0.1:8200` | 否 |
+| `agent_role_id` (或 `VAULT_ROLE_ID`) | Vault AppRole Role ID | `641b3885-...` | 是 |
+| `agent_secret_id` (或 `VAULT_SECRET_ID`) | Vault AppRole Secret ID | `81d9fd9c-...` | 是 |
 
-点击首页的"登录"按钮，将自动跳转到 IBM Verify（order-platform-demo.verify.ibm.com）完成 SSO 身份认证，认证成功后返回主界面。流程基于 OIDC Authorization Code + PKCE 协议。
+### 启动 Vault
 
-### 主要环境变量
+```bash
+# 开发模式启动
+vault server -config=vault/admin.hcl
 
-| 变量 | 说明 | 必填 |
-|------|------|------|
-| `OPENCODE_API_KEY` | OpenCode AI (DeepSeek) API 密钥 | 是 |
-| `VERIFY_ISSUER` | IBM Verify 签发地址 | 否（有默认值） |
-| `VERIFY_CLIENT_ID` | OIDC 应用客户端 ID | 是 |
-| `VERIFY_CLIENT_SECRET` | OIDC 应用客户端密钥 | 是 |
-| `VAULT_ADDR` | Vault 服务地址 | 否 |
-| `VAULT_TOKEN` | Vault 认证令牌 | 否 |
+# 初始化（仅首次）
+vault operator init -key-shares=5 -key-threshold=3
+
+# 解封
+vault operator unseal ...
+
+# 登录
+vault login ...
+
+# 启用 AppRole
+vault auth enable approle
+
+# 创建策略
+vault policy write agent vault/agent.hcl
+vault policy write orders-read vault/orders-read.hcl
+
+# 创建 AppRole
+vault write auth/approle/role/agent \
+    token_policies="agent,orders-read" \
+    token_ttl=1h
+
+# 获取认证信息
+vault read auth/approle/role/agent/role-id
+vault write -f auth/approle/role/agent/secret-id
+
+# 写入 Verify 客户端凭证
+vault kv put secret/verify \
+    agent_client_id="<verify-agent-client-id>" \
+    agent_client_secret="<verify-agent-client-secret>" \
+    sts_client_id="<verify-sts-client-id>" \
+    sts_client_secret="<verify-sts-client-secret>"
+
+# 写入订单 API Token
+vault kv put secret/order/query api_token="QUERY_API_TOKEN_DEMO_123456"
+vault kv put secret/order/delete api_token="DELETE_API_TOKEN_DEMO_654321"
+```
+
+### 启动应用
+
+```bash
+# 设置环境变量（示例）
+export OPENCODE_API_KEY="sk-..."
+export VERIFY_CLIENT_ID="4b51b9d8-..."
+export VERIFY_CLIENT_SECRET="wSjMSRSg..."
+export agent_role_id="641b3885-..."
+export agent_secret_id="81d9fd9c-..."
+
+# 启动主应用 → http://127.0.0.1:18923
+python app.py
+
+# （可选）启动 MCP 订单服务 → http://127.0.0.1:18724
+python mcp_order_server.py
+```
 
 ## API 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET` | `/` | 订单助手主页面 |
+| `GET` | `/` | 主页面 |
 | `GET` | `/api/login` | 重定向到 IBM Verify SSO 登录 |
-| `GET` | `/callback` | OIDC 回调端点，处理授权码交换 |
-| `POST` | `/api/logout` | 登出（清除本地 Session） |
-| `GET` | `/api/user` | 获取当前登录用户信息 |
+| `GET` | `/callback` | OIDC 回调，交换授权码为 Token |
+| `POST` | `/api/logout` | 登出（清除 Session） |
+| `GET` | `/api/user` | 获取当前用户信息 |
 | `GET` | `/api/check-auth` | 检查登录状态 |
 | `GET` | `/api/mcp/tools` | 获取已注册 MCP 工具列表 |
 | `POST` | `/api/mcp/tools` | 注册新的 MCP 工具 |
 | `DELETE` | `/api/mcp/tools/<name>` | 删除指定 MCP 工具 |
-| `GET` | `/api/orders` | MCP — 获取订单列表 |
-| `DELETE` | `/api/orders/<id>` | MCP — 删除指定订单 |
+| `GET` | `/api/agent/logs` | 获取 Agent 日志列表 |
+| `DELETE` | `/api/agent/logs` | 清空 Agent 日志 |
 
-## Token 兑换流程
+### WebSocket 事件
 
-```
-安全凭证链：
-  Verify Client Credential
-       ↓ (Client → Verify)
-  OBO Token               ← 内存缓存 + Session 缓存（TTL 5 分钟）
-       ↓ (OBO → Vault)
-  Vault Token              ← 内存缓存 + Session 缓存（TTL 5 分钟）
-       ↓ (Vault → App Secret Key)
-  应用秘钥 / API Token
-```
-
-- 两层缓存策略：先检查进程内字典缓存，再检查 Session 缓存（跨请求、防 reloader 丢失）
-- 每个 Token 层独立 TTL，过期后自动从上游重新兑换
-- 敏感操作（如删除订单）需要用户弹窗确认后，才从 Vault 获取对应操作的 API Token
-
-## Demo 模拟说明
-
-当前版本采取混合模式运行：
-
-- **IBM Verify OIDC 认证**：真实对接 order-platform-demo.verify.ibm.com，使用 PKCE 授权码流程完成 SSO 登录
-- **Vault 令牌管理**：使用 Demo 模拟模式，Token 和凭证通过 `uuid` 和 `time.sleep` 模拟生成，仅展示安全集成流程，无需真实 Vault 实例
-- OBO Token 兑换、Vault Token 缓存等在 Demo 模式下运行，后续可替换为真实服务调用
+| 事件 | 方向 | 说明 |
+|------|------|------|
+| `chat_message` | 客户端 → 服务端 | 发送用户消息 |
+| `chat_response` | 服务端 → 客户端 | AI 回复（含 tool_calls） |
+| `agent_log` | 服务端 → 客户端 | 实时 Agent 日志推送 |
+| `request_verify` | 服务端 → 客户端 | 请求敏感操作授权 |
+| `verify_response` | 客户端 → 服务端 | 用户授权确认/拒绝 |
 
 ## 技术栈
 
 - **后端** — Python / Flask / Flask-SocketIO
-- **AI** — OpenCode AI (DeepSeek) API
-- **认证** — IBM Verify OIDC（真实 SSO + PKCE）
-- **密钥管理** — HashiCorp Vault（模拟）
-- **前端** — Jinja2 / 原生 JavaScript + CSS（支持亮色/暗色主题）
-- **HTTP 客户端** — httpx（异步 API 调用）
+- **AI 模型** — OpenCode AI (DeepSeek) API
+- **认证** — IBM Verify OIDC（SSO）+ Token Exchange（OBO）
+- **密钥管理** — HashiCorp Vault（AppRole + JWT Auth）
+- **前端** — Jinja2 / 原生 JavaScript + CSS
+- **HTTP 客户端** — httpx（同步 + 异步）
 
 ## 许可证
 
